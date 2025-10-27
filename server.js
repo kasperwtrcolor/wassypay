@@ -1,10 +1,3 @@
-import express from "express";
-import cors from "cors";
-import bodyParser from "body-parser";
-import fetch from "node-fetch";
-import dotenv from "dotenv";
-import { paymentMiddleware } from "x402";
-
 const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
@@ -14,12 +7,21 @@ const { paymentMiddleware } = require("x402");
 
 dotenv.config();
 
-const {
-  DEVBASE_ENDPOINT,
-  DEVFUN_API_KEY,
-  VAULT_ADDRESS,
-  PORT
-} = process.env;
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
+const PORT = process.env.PORT || 3000;
+const DEVBASE_ENDPOINT = process.env.DEVBASE_ENDPOINT;
+const DEVFUN_API_KEY = process.env.DEVFUN_API_KEY;
+const VAULT_ADDRESS = process.env.VAULT_ADDRESS;
+
+// Example route
+app.get("/", (req, res) => {
+  res.send("✅ WASSY PAY Backend is running");
+});
+
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
 /** Helper to call Devbase functions */
 async function callDevbaseFunction(funcName, payload) {
