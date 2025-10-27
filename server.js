@@ -5,11 +5,14 @@ import fetch from "node-fetch";
 import dotenv from "dotenv";
 import { paymentMiddleware } from "x402";
 
-dotenv.config();
+const express = require("express");
+const cors = require("cors");
+const bodyParser = require("body-parser");
+const dotenv = require("dotenv");
+const fetch = require("node-fetch");
+const { paymentMiddleware } = require("x402");
 
-const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+dotenv.config();
 
 const {
   DEVBASE_ENDPOINT,
