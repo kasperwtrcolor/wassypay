@@ -3,7 +3,7 @@ const cors = require("cors");
 const bodyParser = require("body-parser");
 const dotenv = require("dotenv");
 const fetch = require("node-fetch");
-const { paymentMiddleware } = require("x402");
+const { paymentMiddleware } = require("x402/dist/index.js");
 
 dotenv.config();
 
