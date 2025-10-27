@@ -4,11 +4,13 @@ import cors from 'cors';
 import fetch from 'node-fetch';
 import { TwitterApi } from 'twitter-api-v2';
 
-dotenv.config();
+const express = require("express");
+const dotenv = require("dotenv");
+const cors = require("cors");
+const fetch = require("node-fetch");
+const { TwitterApi } = require("twitter-api-v2");
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+dotenv.config();
 
 const client = new TwitterApi({
   appKey: process.env.TWITTER_APP_KEY,
