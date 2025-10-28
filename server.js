@@ -35,15 +35,21 @@ app.post("/api/handleTweet", async (req, res) => {
     const amount = parseFloat(match[2]);
     console.log(`🧾 Parsed command: send $${amount} to @${recipient}`);
 
-    // === 3️⃣ Call Dev.Fun Function ===
-const relayUrl = `https://devbase.dev.fun/api/run/${APP_ID}?func=$FUNC_RELAY_PAYMENT`;
-    const relayRes = await fetch(relayUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        args: [sender_handle, recipient, amount]
-      })
-    });
+// === 3️⃣ Relay payment to Dev.Fun ===
+const APP_ID = process.env.APP_ID || "699840f631c97306a0c4";
+
+const relayUrl = `https://devbase.dev.fun/api/v1/${APP_ID}/run?func=$FUNC_RELAY_PAYMENT`;
+
+const relayRes = await fetch(relayUrl, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    args: [sender_handle, recipient, amount]
+  })
+});
+
+const relayResult = await relayRes.json();
+console.log("🔁 Relay Result:", relayResult);
 
     const relayResult = await relayRes.json().catch(() => ({}));
     console.log("🔁 Relay Result:", relayResult);
