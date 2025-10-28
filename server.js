@@ -32,6 +32,31 @@ app.post("/api/handleTweet", async (req, res) => {
     const recipient = match[1];
     const amount = parseFloat(match[2]);
 
+    // === Call your Dev.Fun function securely ===
+    const relayUrl = `https://devbase.dev.fun/api/v1/${process.env.APP_ID}/run?func=$FUNC_RELAY_PAYMENT`;
+    console.log("🚀 Calling Dev.Fun relay:", relayUrl);
+
+    const relayRes = await fetch(relayUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-devbase-secret": process.env.DEVBASE_SECRET
+      },
+      body: JSON.stringify({
+        args: [sender_handle, recipient, amount]
+      })
+    });
+
+    const relayResult = await relayRes.json();
+    console.log("🔁 Relay Result:", relayResult);
+
+    res.json({ success: true, relayed: relayResult });
+  } catch (err) {
+    console.error("💥 handleTweet error:", err);
+    res.status(500).json({ success: false, message: "Internal Server Error", error: err.message });
+  }
+});
+
     // === 3️⃣ Relay payment to Dev.Fun ===
     const relayUrl = `https://devbase.dev.fun/api/v1/${APP_ID}/run?func=$FUNC_RELAY_PAYMENT`;
 
