@@ -36,7 +36,7 @@ app.post("/api/handleTweet", async (req, res) => {
     console.log(`🧾 Parsed command: send $${amount} to @${recipient}`);
 
     // === 3️⃣ Call Dev.Fun Function ===
-    const relayUrl = `https://dev.fun/api/run/${APP_ID}/$FUNC_RELAY_PAYMENT`;
+const relayUrl = `https://dev.fun/api/run/${APP_ID}?func=$FUNC_RELAY_PAYMENT`;
     const relayRes = await fetch(relayUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
