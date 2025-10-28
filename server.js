@@ -50,3 +50,16 @@ app.post("/api/handleTweet", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 WASSY relay backend running on port ${PORT}`));
+
+const relayUrl = `https://dev.fun/api/run/${process.env.APP_ID}/$FUNC_RELAY_PAYMENT`;
+
+const relayRes = await fetch(relayUrl, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    args: [sender_handle, recipient, amount]
+  })
+});
+
+const relayResult = await relayRes.json();
+console.log("🔁 Relay Result:", relayResult);
