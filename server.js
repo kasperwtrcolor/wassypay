@@ -37,7 +37,7 @@ app.post("/api/handleTweet", async (req, res) => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-devbase-secret": process.env.x-devbase-secret
+        "x-devbase-secret": process.env.DEVBASE_SECRET
       },
       body: JSON.stringify({
         args: [sender_handle, recipient, amount]
