@@ -1,6 +1,12 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { StateClient } from "@devfunlabs/state-client";
+
+const devbase = new StateClient({
+  endpoint: "https://devbase.dev.fun",
+  appId: "699840f631c97306a0c4",
+});
 
 dotenv.config();
 
