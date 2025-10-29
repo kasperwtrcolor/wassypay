@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "build": "echo 'no build step'",
+    "postinstall": "npm install express cors dotenv node-fetch @supabase/supabase-js",
     "dev": "NODE_ENV=development node server.js"
   },
   "dependencies": {
