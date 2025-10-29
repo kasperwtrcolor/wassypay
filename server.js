@@ -14,6 +14,10 @@ const PORT = process.env.PORT || 3000;
 const BOT_HANDLE = (process.env.BOT_HANDLE || "bot_wassy").toLowerCase();
 const X_BEARER_TOKEN = process.env.X_BEARER_TOKEN;
 
+// NEW: configurable interval (default 30 minutes)
+const SCAN_INTERVAL_MIN = Number(process.env.SCAN_INTERVAL_MIN) || 30;
+const SCAN_INTERVAL_MS = SCAN_INTERVAL_MIN * 60 * 1000;
+
 // === DB Setup ===
 let db;
 (async () => {
@@ -35,9 +39,9 @@ let db;
   `);
   console.log("✅ Database initialized");
 
-  // Run hourly check
-  runHourlyTweetCheck();
-  setInterval(runHourlyTweetCheck, 60 * 60 * 1000); // every hour
+  // Run scheduled check
+  runScheduledTweetCheck();
+  setInterval(runScheduledTweetCheck, SCAN_INTERVAL_MS); // every 30 mins by default
 })();
 
 // === Helpers ===
@@ -56,7 +60,11 @@ async function recordPayment(sender, recipient, amount, tweet_id) {
 
 // === Routes ===
 
-app.get("/", (_, res) => res.send("🟢 WASSY API active + hourly X scan running"));
+app.get("/", (_, res) =>
+  res.send(
+    `🟢 WASSY API active + scheduled X scan every ${SCAN_INTERVAL_MIN} min`
+  )
+);
 
 // record from bot (manual mode fallback)
 app.post("/api/record-transaction", async (req, res) => {
@@ -118,9 +126,9 @@ app.get("/api/payments", async (_, res) => {
 
 // === X API Scanner ===
 
-async function runHourlyTweetCheck() {
+async function runScheduledTweetCheck() {
   if (!X_BEARER_TOKEN) {
-    console.warn("⚠️ No X_BEARER_TOKEN set; skipping hourly scan");
+    console.warn("⚠️ No X_BEARER_TOKEN set; skipping scheduled scan");
     return;
   }
 
