@@ -4,6 +4,7 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
+    "preinstall": "rm -rf node_modules package-lock.json || true",
     "start": "node server.js",
     "build": "echo 'no build step'",
     "postinstall": "npm install express cors dotenv node-fetch @supabase/supabase-js",
