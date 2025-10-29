@@ -25,11 +25,11 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
 
 const app = express();
 
-// CORS
+// ---- CORS ----
 const origins = ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // curl/postman
+    if (!origin) return cb(null, true);
     if (origins.length === 0 || origins.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS"));
   },
@@ -37,29 +37,27 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// ---- utilities ----
+// ---- helpers ----
 const norm = (h) => (h || "").replace(/^@/, "").trim().toLowerCase();
 
 async function ensureProfile(handle, { wallet, profile_image } = {}) {
   handle = norm(handle);
-  // Upsert profile
-  let { data: p, error: pErr } = await supabase
+
+  const { data: profiles, error: pErr } = await supabase
     .from("profiles")
     .upsert(
       { handle, wallet: wallet || null, profile_image: profile_image || null },
       { onConflict: "handle" }
     )
-    .select("*")
-    .single();
+    .select("*");
 
   if (pErr) throw pErr;
+  const p = Array.isArray(profiles) ? profiles[0] : profiles;
 
-  // Ensure balances row
-  const { data: b, error: bErr } = await supabase
+  const { data: balances, error: bErr } = await supabase
     .from("balances")
-    .upsert({ handle, balance_usdc: 0 }, { onConflict: "handle", ignoreDuplicates: true })
-    .select("*")
-    .single();
+    .upsert({ handle, balance_usdc: 0 }, { onConflict: "handle" })
+    .select("*");
 
   if (bErr && bErr.code !== "23505") throw bErr;
 
@@ -68,8 +66,12 @@ async function ensureProfile(handle, { wallet, profile_image } = {}) {
 
 async function getBalance(handle) {
   handle = norm(handle);
-  const { data, error } = await supabase.from("balances").select("*").eq("handle", handle).single();
-  if (error && error.code !== "PGRST116") throw error;
+  const { data, error } = await supabase
+    .from("balances")
+    .select("*")
+    .eq("handle", handle)
+    .maybeSingle();
+  if (error) throw error;
   return data ? Number(data.balance_usdc) : 0;
 }
 
@@ -82,22 +84,23 @@ async function setBalance(handle, value) {
 }
 
 async function addLedger(row) {
-  const { data, error } = await supabase.from("ledger").insert(row).select("*").single();
+  const { data, error } = await supabase.from("ledger").insert(row).select("*");
   if (error) throw error;
 
-  // optional n8n notify
+  const d = Array.isArray(data) ? data[0] : data;
+
   if (N8N_WEBHOOK_URL) {
     try {
       await fetch(N8N_WEBHOOK_URL, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(data)
+        body: JSON.stringify(d)
       });
     } catch (e) {
       console.warn("n8n notify failed:", e.message);
     }
   }
-  return data;
+  return d;
 }
 
 // ---- routes ----
@@ -108,7 +111,7 @@ app.get("/", (_, res) => {
 
 app.get("/api/health", (_, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
-// Register / ensure profile
+// register or ensure user
 app.post("/api/register", async (req, res) => {
   try {
     const { handle, wallet, profile_image } = req.body || {};
@@ -121,14 +124,15 @@ app.post("/api/register", async (req, res) => {
   }
 });
 
+// get profile + balance
 app.get("/api/profile", async (req, res) => {
   try {
     const handle = norm(req.query.handle);
     if (!handle) return res.status(400).json({ success: false, message: "handle required" });
 
-    const { data: p, error } = await supabase.from("profiles").select("*").eq("handle", handle).single();
-    if (error && error.code === "PGRST116") return res.json({ success: false, message: "not found" });
+    const { data: p, error } = await supabase.from("profiles").select("*").eq("handle", handle).maybeSingle();
     if (error) throw error;
+    if (!p) return res.json({ success: false, message: "not found" });
 
     const bal = await getBalance(handle);
     res.json({ success: true, profile: p, balance: bal });
@@ -138,7 +142,7 @@ app.get("/api/profile", async (req, res) => {
   }
 });
 
-// Top-up (mock deposit or attach real on-chain later)
+// deposit (mock)
 app.post("/api/deposit", async (req, res) => {
   try {
     let { handle, amount } = req.body || {};
@@ -160,7 +164,7 @@ app.post("/api/deposit", async (req, res) => {
   }
 });
 
-// Send payment (core)
+// payment
 app.post("/api/payment", async (req, res) => {
   try {
     let { from, to, amount } = req.body || {};
@@ -180,7 +184,6 @@ app.post("/api/payment", async (req, res) => {
 
     const balTo = await getBalance(to);
 
-    // atomic-ish: (Supabase lacks multi-stmt tx in REST; acceptable here)
     await setBalance(from, balFrom - amount);
     await setBalance(to, balTo + amount);
 
@@ -192,7 +195,7 @@ app.post("/api/payment", async (req, res) => {
   }
 });
 
-// List movements for a handle
+// list payments
 app.get("/api/payments", async (req, res) => {
   try {
     const handle = norm(req.query.handle);
@@ -214,33 +217,9 @@ app.get("/api/payments", async (req, res) => {
   }
 });
 
-// X webhook-style relay (parse text "send @user $X")
+// X webhook parser
 app.post("/api/handleTweet", async (req, res) => {
   try {
     const { tweet_id, text, sender_handle } = req.body || {};
-    if (!tweet_id || !text || !sender_handle) {
-      return res.status(400).json({ success: false, message: "tweet_id, text, sender_handle required" });
-    }
-    const m = text.match(/send\s*@(\w+)\s*\$?([\d.]+)/i);
-    if (!m) return res.json({ success: false, message: "no command" });
-
-    const to = norm(m[1]);
-    const amount = Number(m[2]);
-    const from = norm(sender_handle);
-
-    const resp = await fetch(`${req.protocol}://${req.get("host")}/api/payment`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ from, to, amount })
-    });
-    const payload = await resp.json();
-    res.json({ success: true, relayed: payload });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ success: false, message: "relay failed", error: e.message });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`🚀 WASSY API listening on :${PORT}`);
-});
+    if (!tweet_id || !text || !sender_handle)
+      return res.status(400).json({ success
