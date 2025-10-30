@@ -119,23 +119,37 @@ app.post("/api/claim", async (req, res) => {
   }
 });
 
-// === Added ?id= support ===
+// === Updated /api/payments route: supports ?id= and ?tweet_id= ===
 app.get("/api/payments", async (req, res) => {
   try {
-    const { id } = req.query;
+    const { id, tweet_id } = req.query;
     let rows;
-    if (id) {
+
+    if (tweet_id) {
       rows = await db.all(
-        "SELECT id, tweet_id, sender, recipient, amount, status, created_at, claimed_at FROM payments WHERE id = ?",
+        `SELECT id, tweet_id, sender, recipient, amount, status, created_at, claimed_at 
+         FROM payments 
+         WHERE tweet_id = ?`,
+        [tweet_id]
+      );
+    } else if (id) {
+      rows = await db.all(
+        `SELECT id, tweet_id, sender, recipient, amount, status, created_at, claimed_at 
+         FROM payments 
+         WHERE id = ?`,
         [id]
       );
     } else {
       rows = await db.all(
-        "SELECT id, tweet_id, sender, recipient, amount, status, created_at, claimed_at FROM payments ORDER BY created_at DESC"
+        `SELECT id, tweet_id, sender, recipient, amount, status, created_at, claimed_at 
+         FROM payments 
+         ORDER BY created_at DESC`
       );
     }
+
     res.json(rows);
   } catch (e) {
+    console.error("💥 /api/payments error:", e.message);
     res.status(500).json({ success: false, message: e.message });
   }
 });
