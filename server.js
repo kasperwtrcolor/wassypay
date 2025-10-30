@@ -14,10 +14,6 @@ const PORT = process.env.PORT || 3000;
 const BOT_HANDLE = (process.env.BOT_HANDLE || "bot_wassy").toLowerCase();
 const X_BEARER_TOKEN = process.env.X_BEARER_TOKEN;
 
-// NEW: configurable interval (default 30 minutes)
-const SCAN_INTERVAL_MIN = Number(process.env.SCAN_INTERVAL_MIN) || 30;
-const SCAN_INTERVAL_MS = SCAN_INTERVAL_MIN * 60 * 1000;
-
 // === DB Setup ===
 let db;
 (async () => {
@@ -39,13 +35,13 @@ let db;
   `);
   console.log("✅ Database initialized");
 
-  // Run scheduled check
+  // Run periodic X scan
   runScheduledTweetCheck();
-  setInterval(runScheduledTweetCheck, SCAN_INTERVAL_MS); // every 30 mins by default
+  // every 30 minutes
+  setInterval(runScheduledTweetCheck, 30 * 60 * 1000);
 })();
 
 // === Helpers ===
-
 async function recordPayment(sender, recipient, amount, tweet_id) {
   try {
     await db.run(
@@ -60,18 +56,16 @@ async function recordPayment(sender, recipient, amount, tweet_id) {
 
 // === Routes ===
 
-app.get("/", (_, res) =>
-  res.send(
-    `🟢 WASSY API active + scheduled X scan every ${SCAN_INTERVAL_MIN} min`
-  )
-);
+// Health check
+app.get("/", (_, res) => res.send("🟢 WASSY backend active"));
 
-// record from bot (manual mode fallback)
+// Manual record (fallback)
 app.post("/api/record-transaction", async (req, res) => {
   try {
     const { sender, recipient, amount, tweet_id } = req.body;
     if (!sender || !recipient || !amount)
       return res.status(400).json({ success: false, message: "Missing fields" });
+
     await recordPayment(sender, recipient, amount, tweet_id);
     res.json({ success: true });
   } catch (e) {
@@ -79,23 +73,28 @@ app.post("/api/record-transaction", async (req, res) => {
   }
 });
 
-// get claims
+// Claims lookup
 app.get("/api/claims", async (req, res) => {
   try {
     const { handle } = req.query;
     if (!handle)
       return res.status(400).json({ success: false, message: "handle required" });
+
     const rows = await db.all(
-      `SELECT * FROM payments WHERE recipient = ? AND status = 'pending' ORDER BY created_at DESC`,
+      `SELECT id, tweet_id, sender, recipient, amount, status, created_at 
+       FROM payments 
+       WHERE recipient = ? AND status = 'pending' 
+       ORDER BY created_at DESC`,
       [handle.toLowerCase()]
     );
+
     res.json({ success: true, claims: rows });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }
 });
 
-// claim payment
+// Claim endpoint (mark claimed)
 app.post("/api/claim", async (req, res) => {
   try {
     const { handle, tweet_id } = req.body;
@@ -106,43 +105,61 @@ app.post("/api/claim", async (req, res) => {
       `SELECT * FROM payments WHERE tweet_id = ? AND recipient = ? AND status = 'pending'`,
       [tweet_id, handle.toLowerCase()]
     );
+
     if (!p) return res.json({ success: false, message: "No pending claim found" });
 
     await db.run(
       `UPDATE payments SET status = 'claimed', claimed_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [p.id]
     );
+
     res.json({ success: true, claimed: p });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }
 });
 
-// view all
-app.get("/api/payments", async (_, res) => {
-  const rows = await db.all("SELECT * FROM payments ORDER BY created_at DESC");
-  res.json(rows);
+// === Added ?id= support ===
+app.get("/api/payments", async (req, res) => {
+  try {
+    const { id } = req.query;
+    let rows;
+    if (id) {
+      rows = await db.all(
+        "SELECT id, tweet_id, sender, recipient, amount, status, created_at, claimed_at FROM payments WHERE id = ?",
+        [id]
+      );
+    } else {
+      rows = await db.all(
+        "SELECT id, tweet_id, sender, recipient, amount, status, created_at, claimed_at FROM payments ORDER BY created_at DESC"
+      );
+    }
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
 });
 
 // === X API Scanner ===
-
 async function runScheduledTweetCheck() {
   if (!X_BEARER_TOKEN) {
-    console.warn("⚠️ No X_BEARER_TOKEN set; skipping scheduled scan");
+    console.warn("⚠️ No X_BEARER_TOKEN set; skipping scan");
     return;
   }
 
   console.log(`🔍 Checking mentions for @${BOT_HANDLE}...`);
-
   try {
     const response = await fetch(
       `https://api.twitter.com/2/tweets/search/recent?query=@${BOT_HANDLE}&tweet.fields=author_id,created_at,text`,
       {
-        headers: {
-          Authorization: `Bearer ${X_BEARER_TOKEN}`
-        }
+        headers: { Authorization: `Bearer ${X_BEARER_TOKEN}` }
       }
     );
+
+    if (response.status === 429) {
+      console.warn("⚠️ Rate limit reached (429 Too Many Requests). Skipping this cycle.");
+      return;
+    }
 
     if (!response.ok) {
       const txt = await response.text();
@@ -173,4 +190,7 @@ async function runScheduledTweetCheck() {
   }
 }
 
-app.listen(PORT, () => console.log(`🚀 WASSY backend listening on ${PORT}`));
+// === Start Server ===
+app.listen(PORT, () => {
+  console.log(`🚀 WASSY backend listening on ${PORT}`);
+});
