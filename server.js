@@ -1,5 +1,4 @@
-// server.js (clean production version)
-
+// server.js — minimalist "tweet feed" backend
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -15,11 +14,11 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const BOT_HANDLE = (process.env.BOT_HANDLE || "bot_wassy").toLowerCase();
 const X_BEARER_TOKEN = process.env.X_BEARER_TOKEN;
-const SCAN_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+const SCAN_INTERVAL_MS = 30 * 60 * 1000; // 30 min
 
 let db;
 
-// ===== DATABASE INIT =====
+// ===== DB SETUP =====
 (async () => {
   db = await open({ filename: "./wassy.db", driver: sqlite3.Database });
 
@@ -30,50 +29,28 @@ let db;
       sender TEXT,
       recipient TEXT,
       amount REAL,
-      status TEXT DEFAULT 'pending', -- pending | claimed
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      claimed_at DATETIME
-    );
-  `);
-
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS meta (
-      key TEXT PRIMARY KEY,
-      value TEXT
+      status TEXT DEFAULT 'pending',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
   `);
 
   console.log("✅ Database initialized");
 
-  // Initial scan
+  // run initial scan + schedule repeats
   runScheduledTweetCheck();
-
-  // Scan every 30 minutes
   setInterval(runScheduledTweetCheck, SCAN_INTERVAL_MS);
 })();
 
 // ===== HELPERS =====
 function normalizeHandle(h) {
-  return h ? h.replace(/^@/, "").toLowerCase() : "";
-}
-
-async function upsertMeta(key, value) {
-  await db.run(
-    `INSERT INTO meta (key, value) VALUES (?, ?)
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-    [key, String(value)]
-  );
-}
-async function getMeta(key) {
-  const row = await db.get(`SELECT value FROM meta WHERE key = ?`, [key]);
-  return row?.value ?? null;
+  return (h || "").replace(/^@/, "").toLowerCase();
 }
 
 async function recordPayment(sender, recipient, amount, tweet_id) {
   try {
     await db.run(
-      `INSERT OR IGNORE INTO payments (tweet_id, sender, recipient, amount, status)
-       VALUES (?, ?, ?, ?, 'pending')`,
+      `INSERT OR IGNORE INTO payments (tweet_id, sender, recipient, amount)
+       VALUES (?, ?, ?, ?)`,
       [tweet_id, String(sender).toLowerCase(), String(recipient).toLowerCase(), amount]
     );
   } catch (e) {
@@ -82,69 +59,45 @@ async function recordPayment(sender, recipient, amount, tweet_id) {
 }
 
 // ===== ROUTES =====
-
-// Health check
 app.get("/", (_, res) =>
-  res.send("🟢 WASSY API active — scans X mentions every 30 minutes")
+  res.send("🟢 WASSY FEED — tracks @bot_wassy send mentions (30 min interval)")
 );
 
-// --- List / search payments ---
+// Return all or filtered payments
 app.get("/api/payments", async (req, res) => {
   try {
-    const { id, tweet_id, recipient, handle, status } = req.query;
-    const singleKey = id || tweet_id;
-
-    if (singleKey) {
-      const row = await db.get(`SELECT * FROM payments WHERE tweet_id = ?`, [String(singleKey)]);
-      if (!row) return res.json({ success: false, message: "not_found" });
-      return res.json({
-        success: true,
-        status: row.status,
-        amount: row.amount,
-        recipient: row.recipient,
-        from_user: row.sender,
-        payment: row,
-        payments: [row]
-      });
-    }
-
-    const where = [];
+    const { recipient, handle, tweet_id, id } = req.query;
+    const filters = [];
     const args = [];
-    if (recipient) {
-      where.push(`recipient = ?`);
-      args.push(normalizeHandle(recipient));
-    }
-    if (handle) {
-      where.push(`recipient = ?`);
-      args.push(normalizeHandle(handle));
-    }
-    if (status) {
-      where.push(`status = ?`);
-      args.push(status);
-    }
 
-    const sql = `SELECT * FROM payments ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY created_at DESC`;
+    if (recipient) { filters.push(`recipient=?`); args.push(normalizeHandle(recipient)); }
+    if (handle)    { filters.push(`recipient=?`); args.push(normalizeHandle(handle)); }
+    if (tweet_id)  { filters.push(`tweet_id=?`);  args.push(String(tweet_id)); }
+    if (id)        { filters.push(`id=?`);        args.push(Number(id)); }
+
+    const sql = `SELECT * FROM payments ${
+      filters.length ? "WHERE " + filters.join(" AND ") : ""
+    } ORDER BY created_at DESC`;
+
     const rows = await db.all(sql, args);
-    res.json(rows);
+    res.json({ success: true, payments: rows });
   } catch (e) {
     console.error("/api/payments error:", e);
     res.status(500).json({ success: false, message: e.message });
   }
 });
 
-// --- Pending claims for handle ---
+// Return pending claims for a user (read-only)
 app.get("/api/claims", async (req, res) => {
   try {
     const handle = normalizeHandle(req.query.handle);
-    if (!handle) {
-      return res.status(400).json({ success: false, message: "handle required" });
-    }
+    if (!handle) return res.status(400).json({ success: false, message: "handle required" });
+
     const rows = await db.all(
-      `SELECT * FROM payments
-       WHERE recipient = ? AND status = 'pending'
-       ORDER BY created_at DESC`,
+      `SELECT * FROM payments WHERE recipient=? ORDER BY created_at DESC`,
       [handle]
     );
+
     res.json({ success: true, claims: rows });
   } catch (e) {
     console.error("/api/claims error:", e);
@@ -152,73 +105,38 @@ app.get("/api/claims", async (req, res) => {
   }
 });
 
-// --- DevFun claim success notifier ---
-app.post("/api/devfun-claim-success", async (req, res) => {
-  try {
-    const { tweet_id, recipient } = req.body;
-    if (!tweet_id) {
-      return res.status(400).json({ success: false, message: "tweet_id required" });
-    }
-
-    const row = await db.get(`SELECT * FROM payments WHERE tweet_id = ?`, [String(tweet_id)]);
-    if (!row) return res.json({ success: false, message: "not_found" });
-
-    if (recipient && normalizeHandle(recipient) !== row.recipient) {
-      return res.json({ success: false, message: "recipient_mismatch" });
-    }
-
-    if (row.status !== "claimed") {
-      await db.run(
-        `UPDATE payments SET status = 'claimed', claimed_at = CURRENT_TIMESTAMP WHERE id = ?`,
-        [row.id]
-      );
-      console.log(`💰 DevFun confirmed claim success for tweet ${tweet_id}`);
-    }
-
-    const updated = await db.get(`SELECT * FROM payments WHERE id = ?`, [row.id]);
-    res.json({ success: true, payment: updated });
-  } catch (e) {
-    console.error("/api/devfun-claim-success error:", e);
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
-
-// --- Optional manual fallback ---
+// Manual insert (optional)
 app.post("/api/record-transaction", async (req, res) => {
   try {
     const { sender, recipient, amount, tweet_id } = req.body;
-    if (!sender || !recipient || !amount || !tweet_id) {
-      return res.status(400).json({ success: false, message: "Missing fields" });
-    }
-    await recordPayment(sender, recipient, Number(amount), String(tweet_id));
+    if (!sender || !recipient || !amount || !tweet_id)
+      return res.status(400).json({ success: false, message: "missing fields" });
+
+    await recordPayment(sender, recipient, amount, tweet_id);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }
 });
 
-// ===== X API SCANNER (every 30 min) =====
+// ===== X API SCANNER =====
 async function runScheduledTweetCheck() {
   if (!X_BEARER_TOKEN) {
     console.warn("⚠️ No X_BEARER_TOKEN set; skipping scan");
     return;
   }
-
   console.log(`🔍 Checking mentions for @${BOT_HANDLE}...`);
 
   try {
-    const lastSeen = await getMeta("last_seen_tweet_id");
     const q = encodeURIComponent(`@${BOT_HANDLE} send`);
-    const url =
-      `https://api.twitter.com/2/tweets/search/recent?query=${q}&tweet.fields=author_id,created_at,text` +
-      (lastSeen ? `&since_id=${lastSeen}` : "");
+    const url = `https://api.twitter.com/2/tweets/search/recent?query=${q}&tweet.fields=author_id,created_at,text`;
 
     const response = await fetch(url, {
       headers: { Authorization: `Bearer ${X_BEARER_TOKEN}` }
     });
 
     if (response.status === 429) {
-      console.warn("⚠️ Rate limit reached (429 Too Many Requests). Skipping this cycle.");
+      console.warn("⚠️ Rate limit reached (429). Skipping this cycle.");
       return;
     }
     if (!response.ok) {
@@ -227,29 +145,24 @@ async function runScheduledTweetCheck() {
     }
 
     const data = await response.json();
-    if (!data.data || data.data.length === 0) {
+    if (!data.data?.length) {
       console.log("No new mentions found.");
       return;
     }
 
-    let newestId = lastSeen;
     for (const tweet of data.data) {
-      const text = (tweet.text || "").toLowerCase();
+      const text = tweet.text?.toLowerCase() || "";
       const match = text.match(/send\s*@(\w+)\s*\$?([\d.]+)/i);
-      if (match) {
-        const recipient = match[1];
-        const amount = parseFloat(match[2]);
-        const sender = tweet.author_id || "unknown";
-        await recordPayment(sender, recipient, amount, tweet.id);
-        console.log(`💸 Recorded ${sender} → ${recipient} $${amount} (tweet ${tweet.id})`);
-      }
-      if (!newestId || BigInt(tweet.id) > BigInt(newestId)) {
-        newestId = tweet.id;
-      }
+      if (!match) continue;
+
+      const recipient = match[1];
+      const amount = parseFloat(match[2]);
+      const sender = tweet.author_id || "unknown";
+      await recordPayment(sender, recipient, amount, tweet.id);
+      console.log(`💸 Recorded ${sender} → ${recipient} $${amount} (${tweet.id})`);
     }
 
-    if (newestId) await upsertMeta("last_seen_tweet_id", newestId);
-    console.log(`✅ X scan complete (${data.data.length} tweets checked).`);
+    console.log(`✅ Scan complete (${data.data.length} tweets checked).`);
   } catch (e) {
     console.error("X scan error:", e.message);
   }
