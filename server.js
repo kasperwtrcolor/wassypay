@@ -1,4 +1,5 @@
-// server.js
+// server.js (clean production version)
+
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -18,7 +19,7 @@ const SCAN_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 
 let db;
 
-// ===== DB SETUP =====
+// ===== DATABASE INIT =====
 (async () => {
   db = await open({ filename: "./wassy.db", driver: sqlite3.Database });
 
@@ -29,7 +30,7 @@ let db;
       sender TEXT,
       recipient TEXT,
       amount REAL,
-      status TEXT DEFAULT 'pending', -- pending | claim_pending | claimed
+      status TEXT DEFAULT 'pending', -- pending | claimed
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       claimed_at DATETIME
     );
@@ -44,18 +45,22 @@ let db;
 
   console.log("✅ Database initialized");
 
-  // Kick one scan at boot (don’t spam if rate-limited)
+  // Initial scan
   runScheduledTweetCheck();
 
-  // Then schedule every 30 minutes
+  // Scan every 30 minutes
   setInterval(runScheduledTweetCheck, SCAN_INTERVAL_MS);
 })();
 
 // ===== HELPERS =====
+function normalizeHandle(h) {
+  return h ? h.replace(/^@/, "").toLowerCase() : "";
+}
+
 async function upsertMeta(key, value) {
   await db.run(
     `INSERT INTO meta (key, value) VALUES (?, ?)
-     ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
     [key, String(value)]
   );
 }
@@ -76,36 +81,22 @@ async function recordPayment(sender, recipient, amount, tweet_id) {
   }
 }
 
-function normalizeHandle(h) {
-  if (!h) return "";
-  return h.replace(/^@/, "").toLowerCase();
-}
-
 // ===== ROUTES =====
 
-// Health
+// Health check
 app.get("/", (_, res) =>
-  res.send("🟢 WASSY API active — 30-min X mention scans + claim lifecycle online")
+  res.send("🟢 WASSY API active — scans X mentions every 30 minutes")
 );
 
-// List/search payments
-// Supports:
-//   /api/payments                -> returns raw array of rows
-//   /api/payments?id=198...      -> returns {success, status, amount, recipient, from_user, payment, payments:[row]}
-//   /api/payments?tweet_id=...   -> same as id
-//   /api/payments?recipient=foo  -> array
-//   /api/payments?handle=@foo    -> array (alias of recipient)
-//   /api/payments?status=pending -> array
+// --- List / search payments ---
 app.get("/api/payments", async (req, res) => {
   try {
     const { id, tweet_id, recipient, handle, status } = req.query;
-
-    // Single fetch by id/tweet_id → return object with status to satisfy both FE & DevFun funcs
     const singleKey = id || tweet_id;
+
     if (singleKey) {
       const row = await db.get(`SELECT * FROM payments WHERE tweet_id = ?`, [String(singleKey)]);
       if (!row) return res.json({ success: false, message: "not_found" });
-
       return res.json({
         success: true,
         status: row.status,
@@ -117,7 +108,6 @@ app.get("/api/payments", async (req, res) => {
       });
     }
 
-    // List with optional filters
     const where = [];
     const args = [];
     if (recipient) {
@@ -142,8 +132,7 @@ app.get("/api/payments", async (req, res) => {
   }
 });
 
-// Pending claims for a handle
-// GET /api/claims?handle=@user
+// --- Pending claims for handle ---
 app.get("/api/claims", async (req, res) => {
   try {
     const handle = normalizeHandle(req.query.handle);
@@ -152,7 +141,7 @@ app.get("/api/claims", async (req, res) => {
     }
     const rows = await db.all(
       `SELECT * FROM payments
-       WHERE recipient = ? AND status IN ('pending', 'claim_pending')
+       WHERE recipient = ? AND status = 'pending'
        ORDER BY created_at DESC`,
       [handle]
     );
@@ -163,34 +152,7 @@ app.get("/api/claims", async (req, res) => {
   }
 });
 
-// Transition: mark claim as "claim_pending" (optional lock to prevent racing)
-app.post("/api/mark-claim-pending", async (req, res) => {
-  try {
-    const { tweet_id, recipient } = req.body;
-    if (!tweet_id) return res.status(400).json({ success: false, message: "tweet_id required" });
-
-    const row = await db.get(`SELECT * FROM payments WHERE tweet_id = ?`, [String(tweet_id)]);
-    if (!row) return res.json({ success: false, message: "not_found" });
-    if (recipient && normalizeHandle(recipient) !== row.recipient) {
-      return res.json({ success: false, message: "recipient_mismatch" });
-    }
-    if (row.status === "claimed") {
-      return res.json({ success: false, message: "already_claimed" });
-    }
-
-    if (row.status !== "claim_pending") {
-      await db.run(`UPDATE payments SET status = 'claim_pending' WHERE id = ?`, [row.id]);
-    }
-    const updated = await db.get(`SELECT * FROM payments WHERE id = ?`, [row.id]);
-    res.json({ success: true, payment: updated });
-  } catch (e) {
-    console.error("/api/mark-claim-pending error:", e);
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
-
-// === NEW ===
-// Called by DevFun when a payment is successfully claimed on-chain
+// --- DevFun claim success notifier ---
 app.post("/api/devfun-claim-success", async (req, res) => {
   try {
     const { tweet_id, recipient } = req.body;
@@ -198,37 +160,30 @@ app.post("/api/devfun-claim-success", async (req, res) => {
       return res.status(400).json({ success: false, message: "tweet_id required" });
     }
 
-    const normalizedRecipient = normalizeHandle(recipient);
     const row = await db.get(`SELECT * FROM payments WHERE tweet_id = ?`, [String(tweet_id)]);
-    if (!row) {
-      return res.status(404).json({ success: false, message: "Payment not found" });
+    if (!row) return res.json({ success: false, message: "not_found" });
+
+    if (recipient && normalizeHandle(recipient) !== row.recipient) {
+      return res.json({ success: false, message: "recipient_mismatch" });
     }
 
-    // Prevent mismatch
-    if (recipient && normalizedRecipient !== row.recipient) {
-      return res.status(400).json({ success: false, message: "recipient mismatch" });
-    }
-
-    // Only update if not already claimed
     if (row.status !== "claimed") {
       await db.run(
-        `UPDATE payments
-         SET status = 'claimed', claimed_at = CURRENT_TIMESTAMP
-         WHERE tweet_id = ?`,
-        [tweet_id]
+        `UPDATE payments SET status = 'claimed', claimed_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [row.id]
       );
-      console.log(`✅ DevFun confirmed claim success for tweet ${tweet_id}`);
+      console.log(`💰 DevFun confirmed claim success for tweet ${tweet_id}`);
     }
 
-    const updated = await db.get(`SELECT * FROM payments WHERE tweet_id = ?`, [tweet_id]);
-    return res.json({ success: true, payment: updated });
+    const updated = await db.get(`SELECT * FROM payments WHERE id = ?`, [row.id]);
+    res.json({ success: true, payment: updated });
   } catch (e) {
     console.error("/api/devfun-claim-success error:", e);
-    return res.status(500).json({ success: false, message: e.message });
+    res.status(500).json({ success: false, message: e.message });
   }
 });
 
-// (Optional) manual record fallback
+// --- Optional manual fallback ---
 app.post("/api/record-transaction", async (req, res) => {
   try {
     const { sender, recipient, amount, tweet_id } = req.body;
@@ -242,7 +197,7 @@ app.post("/api/record-transaction", async (req, res) => {
   }
 });
 
-// ===== X API SCANNER (every 30 mins) =====
+// ===== X API SCANNER (every 30 min) =====
 async function runScheduledTweetCheck() {
   if (!X_BEARER_TOKEN) {
     console.warn("⚠️ No X_BEARER_TOKEN set; skipping scan");
@@ -252,13 +207,15 @@ async function runScheduledTweetCheck() {
   console.log(`🔍 Checking mentions for @${BOT_HANDLE}...`);
 
   try {
-    const lastSeen = await getMeta("last_seen_tweet_id"); // keep pagination simple
+    const lastSeen = await getMeta("last_seen_tweet_id");
     const q = encodeURIComponent(`@${BOT_HANDLE} send`);
     const url =
       `https://api.twitter.com/2/tweets/search/recent?query=${q}&tweet.fields=author_id,created_at,text` +
       (lastSeen ? `&since_id=${lastSeen}` : "");
 
-    const response = await fetch(url, { headers: { Authorization: `Bearer ${X_BEARER_TOKEN}` } });
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${X_BEARER_TOKEN}` }
+    });
 
     if (response.status === 429) {
       console.warn("⚠️ Rate limit reached (429 Too Many Requests). Skipping this cycle.");
@@ -271,15 +228,13 @@ async function runScheduledTweetCheck() {
 
     const data = await response.json();
     if (!data.data || data.data.length === 0) {
-      console.log("No mentions found.");
+      console.log("No new mentions found.");
       return;
     }
 
-    // Track the newest tweet id
     let newestId = lastSeen;
     for (const tweet of data.data) {
       const text = (tweet.text || "").toLowerCase();
-      // Format: "... send @recipient $5"
       const match = text.match(/send\s*@(\w+)\s*\$?([\d.]+)/i);
       if (match) {
         const recipient = match[1];
@@ -292,8 +247,8 @@ async function runScheduledTweetCheck() {
         newestId = tweet.id;
       }
     }
-    if (newestId) await upsertMeta("last_seen_tweet_id", newestId);
 
+    if (newestId) await upsertMeta("last_seen_tweet_id", newestId);
     console.log(`✅ X scan complete (${data.data.length} tweets checked).`);
   } catch (e) {
     console.error("X scan error:", e.message);
