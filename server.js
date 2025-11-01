@@ -19,10 +19,10 @@ let db;
 
 // ===== DB SETUP =====
 (async () => {
-  db = await open({
-    filename: "/data/wassy.db", // persistent path for Render disk
-    driver: sqlite3.Database
-  });
+db = await open({
+  filename: "/mnt/data/wassy.db",
+  driver: sqlite3.Database
+});
 
   await db.exec(`
     CREATE TABLE IF NOT EXISTS payments (
