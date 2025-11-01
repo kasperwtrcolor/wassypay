@@ -19,10 +19,10 @@ let db;
 
 // ===== DB SETUP =====
 (async () => {
-db = await open({
-  filename: "/mnt/data/wassy.db",
-  driver: sqlite3.Database
-});
+  db = await open({
+    filename: "/mnt/data/wassy.db",
+    driver: sqlite3.Database
+  });
 
   await db.exec(`
     CREATE TABLE IF NOT EXISTS payments (
@@ -40,6 +40,16 @@ db = await open({
     CREATE TABLE IF NOT EXISTS meta (
       key TEXT PRIMARY KEY,
       value TEXT
+    );
+  `);
+
+  // ✅ Add deposits table (for tracking user deposits)
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS fund_deposits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      handle TEXT,
+      amount REAL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
   `);
 
@@ -174,6 +184,29 @@ app.post("/api/record-transaction", async (req, res) => {
   }
 });
 
+// === 🪙 ADD: Deposit endpoint (for funding balance) ===
+app.post("/api/deposit", async (req, res) => {
+  try {
+    const { handle, amount } = req.body;
+    if (!handle || !amount) {
+      return res.status(400).json({ success: false, message: "Missing fields" });
+    }
+
+    await db.run(
+      `INSERT INTO fund_deposits (handle, amount, created_at)
+       VALUES (?, ?, CURRENT_TIMESTAMP)`,
+      [handle.toLowerCase(), amount]
+    );
+
+    console.log(`💰 Deposit recorded: ${handle} +${amount} USDC`);
+    res.json({ success: true, message: "Deposit recorded" });
+  } catch (e) {
+    console.error("/api/deposit error:", e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+// === END /api/deposit ===
+
 // Manual rescan (optional testing)
 app.get("/api/rescan", async (req, res) => {
   await runScheduledTweetCheck();
@@ -218,7 +251,6 @@ async function runScheduledTweetCheck() {
       return;
     }
 
-    // Map user IDs → handles
     const users = {};
     if (data.includes && data.includes.users) {
       for (const u of data.includes.users) {
@@ -226,7 +258,6 @@ async function runScheduledTweetCheck() {
       }
     }
 
-    // Process each tweet
     let newestId = lastSeen;
     for (const tweet of data.data) {
       const text = (tweet.text || "").toLowerCase();
