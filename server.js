@@ -20,7 +20,7 @@ let db;
 // ===== DB SETUP =====
 (async () => {
   db = await open({
-    filename: "./wassy.db",
+    filename: "/data/wassy.db", // persistent path for Render disk
     driver: sqlite3.Database
   });
 
@@ -100,10 +100,9 @@ app.get("/api/payments", async (req, res) => {
       const row = await db.get(`SELECT * FROM payments WHERE tweet_id = ?`, [String(singleKey)]);
       if (!row) return res.json({ success: false, message: "not_found" });
 
-      return res.json({
-        success: true,
-        payments: [row]
-      });
+      // normalize to 'recorded'
+      row.status = "recorded";
+      return res.json({ success: true, payments: [row] });
     }
 
     const where = [];
@@ -126,6 +125,10 @@ app.get("/api/payments", async (req, res) => {
     } ORDER BY created_at DESC`;
 
     const rows = await db.all(sql, args);
+
+    // ✅ Always set neutral status
+    rows.forEach(r => (r.status = "recorded"));
+
     res.json({ success: true, payments: rows });
   } catch (e) {
     console.error("/api/payments error:", e);
@@ -141,10 +144,13 @@ app.get("/api/claims", async (req, res) => {
 
     const rows = await db.all(
       `SELECT * FROM payments
-       WHERE recipient = ? AND status = 'pending'
+       WHERE recipient = ? 
        ORDER BY created_at DESC`,
       [handle]
     );
+
+    // mark all as recorded
+    rows.forEach(r => (r.status = "recorded"));
 
     res.json({ success: true, claims: rows });
   } catch (e) {
@@ -153,7 +159,7 @@ app.get("/api/claims", async (req, res) => {
   }
 });
 
-// Manual record endpoint
+// Manual record endpoint (fallback)
 app.post("/api/record-transaction", async (req, res) => {
   try {
     const { sender, recipient, amount, tweet_id } = req.body;
@@ -166,6 +172,12 @@ app.post("/api/record-transaction", async (req, res) => {
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }
+});
+
+// Manual rescan (optional testing)
+app.get("/api/rescan", async (req, res) => {
+  await runScheduledTweetCheck();
+  res.json({ success: true, message: "Manual rescan triggered" });
 });
 
 // ===== TWITTER SCANNER =====
