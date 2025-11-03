@@ -43,7 +43,6 @@ let db;
     );
   `);
 
-  // ✅ Add deposits table (for tracking user deposits)
   await db.exec(`
     CREATE TABLE IF NOT EXISTS fund_deposits (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,11 +77,37 @@ async function getMeta(key) {
 
 async function recordPayment(sender, recipient, amount, tweet_id) {
   try {
-    await db.run(
-      `INSERT OR IGNORE INTO payments (tweet_id, sender, recipient, amount, status)
-       VALUES (?, ?, ?, ?, 'pending')`,
-      [tweet_id, String(sender).toLowerCase(), String(recipient).toLowerCase(), amount]
+    const s = String(sender).toLowerCase();
+    const r = String(recipient).toLowerCase();
+    const a = Number(amount);
+
+    // Skip if same tweet already exists
+    const existingByTweet = await db.get(`SELECT * FROM payments WHERE tweet_id = ?`, [tweet_id]);
+    if (existingByTweet) {
+      console.log(`⛔ Tweet ${tweet_id} already recorded — skipping`);
+      return;
+    }
+
+    // Skip logical duplicates (same sender, recipient, amount in last 2h)
+    const dup = await db.get(
+      `SELECT * FROM payments 
+       WHERE sender = ? AND recipient = ? AND amount = ? 
+         AND created_at >= datetime('now', '-120 minutes')`,
+      [s, r, a]
     );
+    if (dup) {
+      console.log(`⛔ Duplicate detected for @${s} → @${r} $${a} — skipping`);
+      return;
+    }
+
+    // Insert new
+    await db.run(
+      `INSERT INTO payments (tweet_id, sender, recipient, amount, status)
+       VALUES (?, ?, ?, ?, 'pending')`,
+      [tweet_id, s, r, a]
+    );
+
+    console.log(`✅ Payment recorded: @${s} → @${r} $${a} (tweet ${tweet_id})`);
   } catch (e) {
     console.error("recordPayment error:", e.message);
   }
@@ -94,13 +119,10 @@ function normalizeHandle(h) {
 }
 
 // ===== ROUTES =====
-
-// Health check
 app.get("/", (_, res) => {
   res.send("🟢 WASSY PAY backend active — 30-min X scans + tweet-based payment logging");
 });
 
-// List or filter payments
 app.get("/api/payments", async (req, res) => {
   try {
     const { id, tweet_id, recipient, handle, status } = req.query;
@@ -109,8 +131,6 @@ app.get("/api/payments", async (req, res) => {
     if (singleKey) {
       const row = await db.get(`SELECT * FROM payments WHERE tweet_id = ?`, [String(singleKey)]);
       if (!row) return res.json({ success: false, message: "not_found" });
-
-      // normalize to 'recorded'
       row.status = "recorded";
       return res.json({ success: true, payments: [row] });
     }
@@ -135,10 +155,7 @@ app.get("/api/payments", async (req, res) => {
     } ORDER BY created_at DESC`;
 
     const rows = await db.all(sql, args);
-
-    // ✅ Always set neutral status
     rows.forEach(r => (r.status = "recorded"));
-
     res.json({ success: true, payments: rows });
   } catch (e) {
     console.error("/api/payments error:", e);
@@ -146,7 +163,6 @@ app.get("/api/payments", async (req, res) => {
   }
 });
 
-// Pending claims for handle
 app.get("/api/claims", async (req, res) => {
   try {
     const handle = normalizeHandle(req.query.handle);
@@ -158,10 +174,7 @@ app.get("/api/claims", async (req, res) => {
        ORDER BY created_at DESC`,
       [handle]
     );
-
-    // mark all as recorded
     rows.forEach(r => (r.status = "recorded"));
-
     res.json({ success: true, claims: rows });
   } catch (e) {
     console.error("/api/claims error:", e);
@@ -169,14 +182,12 @@ app.get("/api/claims", async (req, res) => {
   }
 });
 
-// Manual record endpoint (fallback)
 app.post("/api/record-transaction", async (req, res) => {
   try {
     const { sender, recipient, amount, tweet_id } = req.body;
     if (!sender || !recipient || !amount || !tweet_id) {
       return res.status(400).json({ success: false, message: "Missing fields" });
     }
-
     await recordPayment(sender, recipient, Number(amount), String(tweet_id));
     res.json({ success: true });
   } catch (e) {
@@ -184,7 +195,6 @@ app.post("/api/record-transaction", async (req, res) => {
   }
 });
 
-// === 🪙 ADD: Deposit endpoint (for funding balance) ===
 app.post("/api/deposit", async (req, res) => {
   try {
     const { handle, amount } = req.body;
@@ -205,9 +215,7 @@ app.post("/api/deposit", async (req, res) => {
     res.status(500).json({ success: false, message: e.message });
   }
 });
-// === END /api/deposit ===
 
-// Manual rescan (optional testing)
 app.get("/api/rescan", async (req, res) => {
   await runScheduledTweetCheck();
   res.json({ success: true, message: "Manual rescan triggered" });
@@ -223,10 +231,10 @@ async function runScheduledTweetCheck() {
   console.log(`🔍 Checking mentions for @${BOT_HANDLE}...`);
   try {
     const lastSeen = await getMeta("last_seen_tweet_id");
-    const q = encodeURIComponent(`@${BOT_HANDLE} send`);
+    const q = encodeURIComponent(`@${BOT_HANDLE} send -is:retweet -is:quote`);
     const url =
       `https://api.twitter.com/2/tweets/search/recent?query=${q}` +
-      `&tweet.fields=author_id,created_at,text` +
+      `&tweet.fields=author_id,created_at,text,referenced_tweets` +
       `&expansions=author_id` +
       `&user.fields=username` +
       (lastSeen ? `&since_id=${lastSeen}` : "");
@@ -261,14 +269,30 @@ async function runScheduledTweetCheck() {
     let newestId = lastSeen;
     for (const tweet of data.data) {
       const text = (tweet.text || "").toLowerCase();
+
+      // 🚫 skip manual RT-style copies
+      if (text.startsWith("rt ") || text.includes(" rt @") || text.includes("\nrt ")) {
+        console.log(`⏭ Skipping manual RT-style tweet ${tweet.id}`);
+        continue;
+      }
+
+      // 🚫 skip if tweet references another as retweet/quote
+      if (tweet.referenced_tweets && Array.isArray(tweet.referenced_tweets)) {
+        const isRef = tweet.referenced_tweets.some(r => r.type === "retweeted" || r.type === "quoted");
+        if (isRef) {
+          console.log(`⏭ Skipping retweet/quote ${tweet.id}`);
+          continue;
+        }
+      }
+
       const match = text.match(/send\s*@(\w+)\s*\$?([\d.]+)/i);
       if (match) {
         const recipient = match[1];
         const amount = parseFloat(match[2]);
         const sender = users[tweet.author_id] || tweet.author_id || "unknown";
         await recordPayment(sender, recipient, amount, tweet.id);
-        console.log(`💸 Recorded @${sender} → @${recipient} $${amount} (tweet ${tweet.id})`);
       }
+
       if (!newestId || BigInt(tweet.id) > BigInt(newestId)) {
         newestId = tweet.id;
       }
