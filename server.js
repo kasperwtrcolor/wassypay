@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 import fetch from "node-fetch";
+import { paymentMiddleware } from "x402"; // 🧩 New import
 
 dotenv.config();
 const app = express();
@@ -14,6 +15,9 @@ const PORT = process.env.PORT || 3000;
 const BOT_HANDLE = (process.env.BOT_HANDLE || "bot_wassy").toLowerCase();
 const X_BEARER_TOKEN = process.env.X_BEARER_TOKEN;
 const SCAN_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+
+// 💰 WASSY PAY RECEIVER WALLET for x402 micro-payments
+const WASSY_USDC_WALLET = process.env.WASSY_USDC_WALLET || "YOUR_SOLANA_USDC_WALLET_ADDRESS";
 
 let db;
 
@@ -54,10 +58,7 @@ let db;
 
   console.log("✅ Database initialized");
 
-  // Run scan at boot
   runScheduledTweetCheck();
-
-  // Schedule every 30 minutes
   setInterval(runScheduledTweetCheck, SCAN_INTERVAL_MS);
 })();
 
@@ -81,14 +82,12 @@ async function recordPayment(sender, recipient, amount, tweet_id) {
     const r = String(recipient).toLowerCase();
     const a = Number(amount);
 
-    // Skip if same tweet already exists
     const existingByTweet = await db.get(`SELECT * FROM payments WHERE tweet_id = ?`, [tweet_id]);
     if (existingByTweet) {
       console.log(`⛔ Tweet ${tweet_id} already recorded — skipping`);
       return;
     }
 
-    // Skip logical duplicates (same sender, recipient, amount in last 2h)
     const dup = await db.get(
       `SELECT * FROM payments 
        WHERE sender = ? AND recipient = ? AND amount = ? 
@@ -100,7 +99,6 @@ async function recordPayment(sender, recipient, amount, tweet_id) {
       return;
     }
 
-    // Insert new
     await db.run(
       `INSERT INTO payments (tweet_id, sender, recipient, amount, status)
        VALUES (?, ?, ?, ?, 'pending')`,
@@ -126,8 +124,8 @@ app.get("/", (_, res) => {
 app.get("/api/payments", async (req, res) => {
   try {
     const { id, tweet_id, recipient, handle, status } = req.query;
-
     const singleKey = id || tweet_id;
+
     if (singleKey) {
       const row = await db.get(`SELECT * FROM payments WHERE tweet_id = ?`, [String(singleKey)]);
       if (!row) return res.json({ success: false, message: "not_found" });
@@ -182,6 +180,31 @@ app.get("/api/claims", async (req, res) => {
   }
 });
 
+// 🧩 x402 micro-payment protection — claim requires $0.01 USDC
+app.use(paymentMiddleware(WASSY_USDC_WALLET, { "/api/claim": "$0.01" }));
+
+// === /api/claim route (now requires x402 payment) ===
+app.post("/api/claim", async (req, res) => {
+  try {
+    const { handle, tweet_id } = req.body;
+    if (!handle || !tweet_id)
+      return res.status(400).json({ success: false, message: "Missing handle or tweet_id" });
+
+    const p = await db.get(
+      `SELECT * FROM payments WHERE tweet_id = ? AND recipient = ?`,
+      [tweet_id, handle.toLowerCase()]
+    );
+    if (!p) return res.json({ success: false, message: "No matching payment" });
+
+    console.log(`✅ Claim request paid via x402 — @${handle} claiming tweet ${tweet_id}`);
+    res.json({ success: true, message: "Claim accepted after payment", payment: p });
+  } catch (e) {
+    console.error("/api/claim error:", e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// Manual record endpoint
 app.post("/api/record-transaction", async (req, res) => {
   try {
     const { sender, recipient, amount, tweet_id } = req.body;
@@ -270,15 +293,15 @@ async function runScheduledTweetCheck() {
     for (const tweet of data.data) {
       const text = (tweet.text || "").toLowerCase();
 
-      // 🚫 skip manual RT-style copies
       if (text.startsWith("rt ") || text.includes(" rt @") || text.includes("\nrt ")) {
         console.log(`⏭ Skipping manual RT-style tweet ${tweet.id}`);
         continue;
       }
 
-      // 🚫 skip if tweet references another as retweet/quote
       if (tweet.referenced_tweets && Array.isArray(tweet.referenced_tweets)) {
-        const isRef = tweet.referenced_tweets.some(r => r.type === "retweeted" || r.type === "quoted");
+        const isRef = tweet.referenced_tweets.some(
+          r => r.type === "retweeted" || r.type === "quoted"
+        );
         if (isRef) {
           console.log(`⏭ Skipping retweet/quote ${tweet.id}`);
           continue;
