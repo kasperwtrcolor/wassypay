@@ -118,6 +118,34 @@ function normalizeHandle(h) {
   return h.replace(/^@/, "").toLowerCase();
 }
 
+/**
+ * ✅ NEW: Parse BOTH formats
+ * 1) "@bot_wassy send @user $5"
+ * 2) "@bot_wassy send $5 to @user"
+ *
+ * Returns: { recipient, amount } or null
+ */
+function parsePaymentCommand(text) {
+  if (!text) return null;
+
+  // keep original text for @handle capture; use case-insensitive regex
+  const t = String(text).trim();
+
+  // Format A: send @user $5
+  const a = t.match(/send\s+@(\w+)\s*\$?\s*([\d.]+)/i);
+  if (a) {
+    return { recipient: a[1], amount: parseFloat(a[2]) };
+  }
+
+  // Format B: send $5 to @user
+  const b = t.match(/send\s*\$?\s*([\d.]+)\s*(?:to)?\s*@(\w+)/i);
+  if (b) {
+    return { recipient: b[2], amount: parseFloat(b[1]) };
+  }
+
+  return null;
+}
+
 // ===== ROUTES =====
 app.get("/", (_, res) => {
   res.send("🟢 WASSY PAY backend active — 30-min X scans + tweet-based payment logging");
@@ -231,7 +259,10 @@ async function runScheduledTweetCheck() {
   console.log(`🔍 Checking mentions for @${BOT_HANDLE}...`);
   try {
     const lastSeen = await getMeta("last_seen_tweet_id");
+
+    // keep your existing filters
     const q = encodeURIComponent(`@${BOT_HANDLE} send -is:retweet -is:quote`);
+
     const url =
       `https://api.twitter.com/2/tweets/search/recent?query=${q}` +
       `&tweet.fields=author_id,created_at,text,referenced_tweets` +
@@ -285,12 +316,11 @@ async function runScheduledTweetCheck() {
         }
       }
 
-      const match = text.match(/send\s*@(\w+)\s*\$?([\d.]+)/i);
-      if (match) {
-        const recipient = match[1];
-        const amount = parseFloat(match[2]);
+      // ✅ NEW: support both command formats
+      const parsed = parsePaymentCommand(tweet.text || "");
+      if (parsed && parsed.recipient && Number.isFinite(parsed.amount)) {
         const sender = users[tweet.author_id] || tweet.author_id || "unknown";
-        await recordPayment(sender, recipient, amount, tweet.id);
+        await recordPayment(sender, parsed.recipient, parsed.amount, tweet.id);
       }
 
       if (!newestId || BigInt(tweet.id) > BigInt(newestId)) {
