@@ -14,28 +14,55 @@ const PORT = process.env.PORT || 3000;
 const BOT_HANDLE = (process.env.BOT_HANDLE || "bot_wassy").toLowerCase();
 const X_BEARER_TOKEN = process.env.X_BEARER_TOKEN;
 const SCAN_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+const ADMIN_WALLET = process.env.ADMIN_WALLET || "6SxLVfFovSjR2LAFcJ5wfT6RFjc8GxsscRekGnLq8BMe";
 
 let db;
 
 // ===== DB SETUP =====
 (async () => {
   db = await open({
-    filename: "/mnt/data/wassy.db",
+    filename: process.env.DB_PATH || "./wassy.db",
     driver: sqlite3.Database
   });
 
+  // Users table - stores registered users
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      x_username TEXT UNIQUE NOT NULL,
+      x_user_id TEXT,
+      wallet_address TEXT,
+      is_delegated INTEGER DEFAULT 0,
+      delegation_amount REAL DEFAULT 0,
+      delegation_signature TEXT,
+      total_deposited REAL DEFAULT 0,
+      total_sent REAL DEFAULT 0,
+      total_claimed REAL DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  // Payments table - stores all payment records from tweets
   await db.exec(`
     CREATE TABLE IF NOT EXISTS payments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       tweet_id TEXT UNIQUE,
-      sender TEXT,
-      recipient TEXT,
-      amount REAL,
+      sender TEXT NOT NULL,
+      sender_username TEXT,
+      recipient TEXT NOT NULL,
+      recipient_username TEXT,
+      amount REAL NOT NULL,
       status TEXT DEFAULT 'pending',
+      claimed_by TEXT,
+      tx_signature TEXT,
+      error_message TEXT,
+      tweet_url TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
   `);
 
+  // Meta table for key-value storage
   await db.exec(`
     CREATE TABLE IF NOT EXISTS meta (
       key TEXT PRIMARY KEY,
@@ -43,6 +70,7 @@ let db;
     );
   `);
 
+  // Fund deposits tracking
   await db.exec(`
     CREATE TABLE IF NOT EXISTS fund_deposits (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,10 +103,25 @@ async function getMeta(key) {
   return row?.value ?? null;
 }
 
+function normalizeHandle(h) {
+  if (!h) return "";
+  return h.replace(/^@/, "").toLowerCase();
+}
+
+async function ensureUser(x_username) {
+  const handle = normalizeHandle(x_username);
+  let user = await db.get(`SELECT * FROM users WHERE x_username = ?`, [handle]);
+  if (!user) {
+    await db.run(`INSERT INTO users (x_username) VALUES (?)`, [handle]);
+    user = await db.get(`SELECT * FROM users WHERE x_username = ?`, [handle]);
+  }
+  return user;
+}
+
 async function recordPayment(sender, recipient, amount, tweet_id) {
   try {
-    const s = String(sender).toLowerCase();
-    const r = String(recipient).toLowerCase();
+    const s = normalizeHandle(sender);
+    const r = normalizeHandle(recipient);
     const a = Number(amount);
 
     // Skip if same tweet already exists
@@ -100,12 +143,16 @@ async function recordPayment(sender, recipient, amount, tweet_id) {
       return;
     }
 
-    // Insert new
+    // Insert new payment
     await db.run(
-      `INSERT INTO payments (tweet_id, sender, recipient, amount, status)
-       VALUES (?, ?, ?, ?, 'pending')`,
-      [tweet_id, s, r, a]
+      `INSERT INTO payments (tweet_id, sender, sender_username, recipient, recipient_username, amount, status, tweet_url)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`,
+      [tweet_id, s, s, r, r, a, `https://twitter.com/i/status/${tweet_id}`]
     );
+
+    // Ensure both users exist
+    await ensureUser(s);
+    await ensureUser(r);
 
     console.log(`✅ Payment recorded: @${s} → @${r} $${a} (tweet ${tweet_id})`);
   } catch (e) {
@@ -113,22 +160,8 @@ async function recordPayment(sender, recipient, amount, tweet_id) {
   }
 }
 
-function normalizeHandle(h) {
-  if (!h) return "";
-  return h.replace(/^@/, "").toLowerCase();
-}
-
-/**
- * ✅ NEW: Parse BOTH formats
- * 1) "@bot_wassy send @user $5"
- * 2) "@bot_wassy send $5 to @user"
- *
- * Returns: { recipient, amount } or null
- */
 function parsePaymentCommand(text) {
   if (!text) return null;
-
-  // keep original text for @handle capture; use case-insensitive regex
   const t = String(text).trim();
 
   // Format A: send @user $5
@@ -151,6 +184,102 @@ app.get("/", (_, res) => {
   res.send("🟢 WASSY PAY backend active — 30-min X scans + tweet-based payment logging");
 });
 
+app.get("/health", (_, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
+});
+
+// ===== USER AUTHENTICATION =====
+
+// POST /api/login - Register or login user
+app.post("/api/login", async (req, res) => {
+  try {
+    const { x_username, x_user_id, wallet_address } = req.body;
+    if (!x_username) {
+      return res.status(400).json({ success: false, message: "x_username required" });
+    }
+
+    const handle = normalizeHandle(x_username);
+
+    // Upsert user
+    await db.run(
+      `INSERT INTO users (x_username, x_user_id, wallet_address, updated_at)
+       VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(x_username) DO UPDATE SET 
+         x_user_id = COALESCE(excluded.x_user_id, x_user_id),
+         wallet_address = COALESCE(excluded.wallet_address, wallet_address),
+         updated_at = CURRENT_TIMESTAMP`,
+      [handle, x_user_id || null, wallet_address || null]
+    );
+
+    const user = await db.get(`SELECT * FROM users WHERE x_username = ?`, [handle]);
+
+    console.log(`👤 User logged in: @${handle} (wallet: ${wallet_address?.slice(0, 8)}...)`);
+
+    res.json({
+      success: true,
+      is_delegated: !!user.is_delegated,
+      delegation_amount: user.delegation_amount || 0,
+      wallet_address: user.wallet_address
+    });
+  } catch (e) {
+    console.error("/api/login error:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// POST /api/authorize - Record delegation authorization
+app.post("/api/authorize", async (req, res) => {
+  try {
+    const { wallet, amount, signature } = req.body;
+    if (!wallet || !amount) {
+      return res.status(400).json({ success: false, message: "wallet and amount required" });
+    }
+
+    await db.run(
+      `UPDATE users SET 
+        is_delegated = 1,
+        delegation_amount = ?,
+        delegation_signature = ?,
+        updated_at = CURRENT_TIMESTAMP
+       WHERE wallet_address = ?`,
+      [Number(amount), signature || null, wallet]
+    );
+
+    console.log(`🔐 Authorization recorded: ${wallet.slice(0, 8)}... for $${amount}`);
+
+    res.json({ success: true, message: "Authorization recorded" });
+  } catch (e) {
+    console.error("/api/authorize error:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ===== PAYMENTS =====
+
+// GET /api/payments/:username - Get payments for a user
+app.get("/api/payments/:username", async (req, res) => {
+  try {
+    const handle = normalizeHandle(req.params.username);
+    if (!handle) {
+      return res.status(400).json({ success: false, message: "username required" });
+    }
+
+    const rows = await db.all(
+      `SELECT * FROM payments 
+       WHERE sender_username = ? OR recipient_username = ?
+       ORDER BY created_at DESC
+       LIMIT 100`,
+      [handle, handle]
+    );
+
+    res.json({ success: true, payments: rows });
+  } catch (e) {
+    console.error("/api/payments/:username error:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// GET /api/payments - Query payments (existing endpoint)
 app.get("/api/payments", async (req, res) => {
   try {
     const { id, tweet_id, recipient, handle, status } = req.query;
@@ -159,31 +288,28 @@ app.get("/api/payments", async (req, res) => {
     if (singleKey) {
       const row = await db.get(`SELECT * FROM payments WHERE tweet_id = ?`, [String(singleKey)]);
       if (!row) return res.json({ success: false, message: "not_found" });
-      row.status = "recorded";
       return res.json({ success: true, payments: [row] });
     }
 
     const where = [];
     const args = [];
     if (recipient) {
-      where.push(`recipient = ?`);
+      where.push(`recipient_username = ?`);
       args.push(normalizeHandle(recipient));
     }
     if (handle) {
-      where.push(`recipient = ?`);
-      args.push(normalizeHandle(handle));
+      where.push(`(sender_username = ? OR recipient_username = ?)`);
+      args.push(normalizeHandle(handle), normalizeHandle(handle));
     }
     if (status) {
       where.push(`status = ?`);
       args.push(status);
     }
 
-    const sql = `SELECT * FROM payments ${
-      where.length ? "WHERE " + where.join(" AND ") : ""
-    } ORDER BY created_at DESC`;
+    const sql = `SELECT * FROM payments ${where.length ? "WHERE " + where.join(" AND ") : ""
+      } ORDER BY created_at DESC LIMIT 100`;
 
     const rows = await db.all(sql, args);
-    rows.forEach(r => (r.status = "recorded"));
     res.json({ success: true, payments: rows });
   } catch (e) {
     console.error("/api/payments error:", e);
@@ -191,18 +317,24 @@ app.get("/api/payments", async (req, res) => {
   }
 });
 
+// ===== CLAIMS =====
+
+// GET /api/claims - Get pending claims for a user
 app.get("/api/claims", async (req, res) => {
   try {
     const handle = normalizeHandle(req.query.handle);
-    if (!handle) return res.status(400).json({ success: false, message: "handle required" });
+    if (!handle) {
+      return res.status(400).json({ success: false, message: "handle required" });
+    }
 
+    // Get payments where user is recipient and not yet claimed
     const rows = await db.all(
       `SELECT * FROM payments
-       WHERE recipient = ? 
+       WHERE recipient_username = ? AND status = 'pending' AND claimed_by IS NULL
        ORDER BY created_at DESC`,
       [handle]
     );
-    rows.forEach(r => (r.status = "recorded"));
+
     res.json({ success: true, claims: rows });
   } catch (e) {
     console.error("/api/claims error:", e);
@@ -210,18 +342,73 @@ app.get("/api/claims", async (req, res) => {
   }
 });
 
-app.post("/api/record-transaction", async (req, res) => {
+// POST /api/claim - Claim a payment
+app.post("/api/claim", async (req, res) => {
   try {
-    const { sender, recipient, amount, tweet_id } = req.body;
-    if (!sender || !recipient || !amount || !tweet_id) {
-      return res.status(400).json({ success: false, message: "Missing fields" });
+    const { tweet_id, wallet, username } = req.body;
+    if (!tweet_id || !wallet || !username) {
+      return res.status(400).json({ success: false, message: "tweet_id, wallet, and username required" });
     }
-    await recordPayment(sender, recipient, Number(amount), String(tweet_id));
-    res.json({ success: true });
+
+    const handle = normalizeHandle(username);
+
+    // Check if payment exists and is claimable
+    const payment = await db.get(
+      `SELECT * FROM payments WHERE tweet_id = ? AND recipient_username = ?`,
+      [tweet_id, handle]
+    );
+
+    if (!payment) {
+      return res.status(404).json({ success: false, error: "Payment not found" });
+    }
+
+    if (payment.status === 'completed' || payment.claimed_by) {
+      return res.status(400).json({ success: false, error: "Payment already claimed" });
+    }
+
+    // Mark as claimed (in a real implementation, this would trigger the on-chain transfer)
+    await db.run(
+      `UPDATE payments SET 
+        status = 'completed',
+        claimed_by = ?,
+        updated_at = CURRENT_TIMESTAMP
+       WHERE tweet_id = ?`,
+      [wallet, tweet_id]
+    );
+
+    // Update user stats
+    await db.run(
+      `UPDATE users SET 
+        total_claimed = total_claimed + ?,
+        updated_at = CURRENT_TIMESTAMP
+       WHERE x_username = ?`,
+      [payment.amount, handle]
+    );
+
+    // Update sender stats
+    await db.run(
+      `UPDATE users SET 
+        total_sent = total_sent + ?,
+        updated_at = CURRENT_TIMESTAMP
+       WHERE x_username = ?`,
+      [payment.amount, payment.sender_username]
+    );
+
+    console.log(`💰 Payment claimed: @${payment.sender_username} → @${handle} $${payment.amount}`);
+
+    res.json({
+      success: true,
+      message: "Payment claimed successfully",
+      amount: payment.amount,
+      sender: payment.sender_username
+    });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
+    console.error("/api/claim error:", e);
+    res.status(500).json({ success: false, error: e.message });
   }
 });
+
+// ===== DEPOSITS =====
 
 app.post("/api/deposit", async (req, res) => {
   try {
@@ -230,10 +417,21 @@ app.post("/api/deposit", async (req, res) => {
       return res.status(400).json({ success: false, message: "Missing fields" });
     }
 
+    const normalizedHandle = normalizeHandle(handle);
+
     await db.run(
       `INSERT INTO fund_deposits (handle, amount, created_at)
        VALUES (?, ?, CURRENT_TIMESTAMP)`,
-      [handle.toLowerCase(), amount]
+      [normalizedHandle, amount]
+    );
+
+    // Update user's total deposited
+    await db.run(
+      `UPDATE users SET 
+        total_deposited = total_deposited + ?,
+        updated_at = CURRENT_TIMESTAMP
+       WHERE x_username = ?`,
+      [Number(amount), normalizedHandle]
     );
 
     console.log(`💰 Deposit recorded: ${handle} +${amount} USDC`);
@@ -244,6 +442,28 @@ app.post("/api/deposit", async (req, res) => {
   }
 });
 
+// ===== ADMIN =====
+
+// GET /api/admin/users - Get all users (admin only)
+app.get("/api/admin/users", async (req, res) => {
+  try {
+    // In production, add proper authentication here
+    const users = await db.all(
+      `SELECT x_username, wallet_address, is_delegated, delegation_amount,
+              total_deposited, total_sent, total_claimed, created_at
+       FROM users
+       ORDER BY (total_deposited + total_sent + total_claimed) DESC
+       LIMIT 100`
+    );
+
+    res.json({ success: true, users });
+  } catch (e) {
+    console.error("/api/admin/users error:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// GET /api/rescan - Trigger manual tweet scan
 app.get("/api/rescan", async (req, res) => {
   await runScheduledTweetCheck();
   res.json({ success: true, message: "Manual rescan triggered" });
@@ -260,7 +480,6 @@ async function runScheduledTweetCheck() {
   try {
     const lastSeen = await getMeta("last_seen_tweet_id");
 
-    // keep your existing filters
     const q = encodeURIComponent(`@${BOT_HANDLE} send -is:retweet -is:quote`);
 
     const url =
@@ -301,13 +520,13 @@ async function runScheduledTweetCheck() {
     for (const tweet of data.data) {
       const text = (tweet.text || "").toLowerCase();
 
-      // 🚫 skip manual RT-style copies
+      // Skip manual RT-style copies
       if (text.startsWith("rt ") || text.includes(" rt @") || text.includes("\nrt ")) {
         console.log(`⏭ Skipping manual RT-style tweet ${tweet.id}`);
         continue;
       }
 
-      // 🚫 skip if tweet references another as retweet/quote
+      // Skip if tweet references another as retweet/quote
       if (tweet.referenced_tweets && Array.isArray(tweet.referenced_tweets)) {
         const isRef = tweet.referenced_tweets.some(r => r.type === "retweeted" || r.type === "quoted");
         if (isRef) {
@@ -316,7 +535,7 @@ async function runScheduledTweetCheck() {
         }
       }
 
-      // ✅ NEW: support both command formats
+      // Parse payment command
       const parsed = parsePaymentCommand(tweet.text || "");
       if (parsed && parsed.recipient && Number.isFinite(parsed.amount)) {
         const sender = users[tweet.author_id] || tweet.author_id || "unknown";
