@@ -4,6 +4,8 @@ import dotenv from "dotenv";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 import fetch from "node-fetch";
+import { Connection, PublicKey } from "@solana/web3.js";
+import { getAssociatedTokenAddress, getAccount } from "@solana/spl-token";
 
 dotenv.config();
 const app = express();
@@ -15,6 +17,14 @@ const BOT_HANDLE = (process.env.BOT_HANDLE || "bot_wassy").toLowerCase();
 const X_BEARER_TOKEN = process.env.X_BEARER_TOKEN;
 const SCAN_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 const ADMIN_WALLET = process.env.ADMIN_WALLET || "6SxLVfFovSjR2LAFcJ5wfT6RFjc8GxsscRekGnLq8BMe";
+
+// Solana configuration
+const SOLANA_RPC = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
+const USDC_MINT = process.env.USDC_MINT || "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const VAULT_ADDRESS = process.env.VAULT_ADDRESS || "6SxLVfFovSjR2LAFcJ5wfT6RFjc8GxsscRekGnLq8BMe";
+
+// Create Solana connection
+const solanaConnection = new Connection(SOLANA_RPC, "confirmed");
 
 let db;
 
@@ -116,6 +126,46 @@ async function ensureUser(x_username) {
     user = await db.get(`SELECT * FROM users WHERE x_username = ?`, [handle]);
   }
   return user;
+}
+
+// Get sender's on-chain USDC balance and authorization status
+async function getSenderFundStatus(walletAddress) {
+  if (!walletAddress) {
+    return { balance: 0, authorized: false, error: "No wallet address" };
+  }
+
+  try {
+    const walletPubkey = new PublicKey(walletAddress);
+    const usdcMintPubkey = new PublicKey(USDC_MINT);
+    const vaultPubkey = new PublicKey(VAULT_ADDRESS);
+
+    // Get sender's USDC token account
+    const ata = await getAssociatedTokenAddress(usdcMintPubkey, walletPubkey);
+
+    let balance = 0;
+    let delegatedAmount = 0;
+    let authorized = false;
+
+    try {
+      const tokenAccount = await getAccount(solanaConnection, ata);
+      // Balance is in smallest units (6 decimals for USDC)
+      balance = Number(tokenAccount.amount) / 1_000_000;
+
+      // Check if vault is the delegate and has allowance
+      if (tokenAccount.delegate && tokenAccount.delegate.equals(vaultPubkey)) {
+        delegatedAmount = Number(tokenAccount.delegatedAmount) / 1_000_000;
+        authorized = delegatedAmount > 0;
+      }
+    } catch (tokenErr) {
+      // Token account doesn't exist = 0 balance
+      console.log(`Token account not found for ${walletAddress}`);
+    }
+
+    return { balance, delegatedAmount, authorized, error: null };
+  } catch (e) {
+    console.error(`Error getting fund status for ${walletAddress}:`, e.message);
+    return { balance: 0, delegatedAmount: 0, authorized: false, error: e.message };
+  }
 }
 
 async function recordPayment(sender, recipient, amount, tweet_id) {
@@ -319,7 +369,7 @@ app.get("/api/payments", async (req, res) => {
 
 // ===== CLAIMS =====
 
-// GET /api/claims - Get pending claims for a user
+// GET /api/claims - Get pending claims for a user (with sender fund status)
 app.get("/api/claims", async (req, res) => {
   try {
     const handle = normalizeHandle(req.query.handle);
@@ -329,20 +379,44 @@ app.get("/api/claims", async (req, res) => {
 
     // Get payments where user is recipient and not yet claimed
     const rows = await db.all(
-      `SELECT * FROM payments
-       WHERE recipient_username = ? AND status = 'pending' AND claimed_by IS NULL
-       ORDER BY created_at DESC`,
+      `SELECT p.*, u.wallet_address as sender_wallet, u.is_delegated as sender_db_delegated
+       FROM payments p
+       LEFT JOIN users u ON p.sender_username = u.x_username
+       WHERE p.recipient_username = ? AND p.status = 'pending' AND p.claimed_by IS NULL
+       ORDER BY p.created_at DESC`,
       [handle]
     );
 
-    res.json({ success: true, claims: rows });
+    // Enrich each claim with on-chain sender fund status
+    const enrichedClaims = await Promise.all(rows.map(async (claim) => {
+      if (claim.sender_wallet) {
+        const fundStatus = await getSenderFundStatus(claim.sender_wallet);
+        return {
+          ...claim,
+          sender_balance: fundStatus.balance,
+          sender_delegated_amount: fundStatus.delegatedAmount,
+          sender_authorized: fundStatus.authorized,
+          sender_can_pay: fundStatus.authorized && fundStatus.delegatedAmount >= claim.amount
+        };
+      }
+      // No wallet registered for sender
+      return {
+        ...claim,
+        sender_balance: 0,
+        sender_delegated_amount: 0,
+        sender_authorized: false,
+        sender_can_pay: false
+      };
+    }));
+
+    res.json({ success: true, claims: enrichedClaims });
   } catch (e) {
     console.error("/api/claims error:", e);
     res.status(500).json({ success: false, message: e.message });
   }
 });
 
-// POST /api/claim - Claim a payment
+// POST /api/claim - Claim a payment (with sender fund verification)
 app.post("/api/claim", async (req, res) => {
   try {
     const { tweet_id, wallet, username } = req.body;
@@ -354,7 +428,10 @@ app.post("/api/claim", async (req, res) => {
 
     // Check if payment exists and is claimable
     const payment = await db.get(
-      `SELECT * FROM payments WHERE tweet_id = ? AND recipient_username = ?`,
+      `SELECT p.*, u.wallet_address as sender_wallet
+       FROM payments p
+       LEFT JOIN users u ON p.sender_username = u.x_username
+       WHERE p.tweet_id = ? AND p.recipient_username = ?`,
       [tweet_id, handle]
     );
 
@@ -364,6 +441,55 @@ app.post("/api/claim", async (req, res) => {
 
     if (payment.status === 'completed' || payment.claimed_by) {
       return res.status(400).json({ success: false, error: "Payment already claimed" });
+    }
+
+    // Verify sender has sufficient authorized funds on-chain
+    if (payment.sender_wallet) {
+      const fundStatus = await getSenderFundStatus(payment.sender_wallet);
+
+      if (!fundStatus.authorized) {
+        return res.status(400).json({
+          success: false,
+          error: "Sender has not authorized the vault. Ask them to authorize first.",
+          sender_status: {
+            authorized: false,
+            balance: fundStatus.balance,
+            delegated_amount: fundStatus.delegatedAmount
+          }
+        });
+      }
+
+      if (fundStatus.delegatedAmount < payment.amount) {
+        return res.status(400).json({
+          success: false,
+          error: `Sender's authorized amount ($${fundStatus.delegatedAmount.toFixed(2)}) is less than payment amount ($${payment.amount}).`,
+          sender_status: {
+            authorized: true,
+            balance: fundStatus.balance,
+            delegated_amount: fundStatus.delegatedAmount,
+            required: payment.amount
+          }
+        });
+      }
+
+      if (fundStatus.balance < payment.amount) {
+        return res.status(400).json({
+          success: false,
+          error: `Sender's USDC balance ($${fundStatus.balance.toFixed(2)}) is less than payment amount ($${payment.amount}).`,
+          sender_status: {
+            authorized: true,
+            balance: fundStatus.balance,
+            delegated_amount: fundStatus.delegatedAmount,
+            required: payment.amount
+          }
+        });
+      }
+    } else {
+      // Sender hasn't registered their wallet
+      return res.status(400).json({
+        success: false,
+        error: "Sender has not registered a wallet. They need to log in and fund their account."
+      });
     }
 
     // Mark as claimed (in a real implementation, this would trigger the on-chain transfer)
