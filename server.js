@@ -496,8 +496,7 @@ app.post("/api/claim", async (req, res) => {
     await db.run(
       `UPDATE payments SET 
         status = 'completed',
-        claimed_by = ?,
-        updated_at = CURRENT_TIMESTAMP
+        claimed_by = ?
        WHERE tweet_id = ?`,
       [wallet, tweet_id]
     );
