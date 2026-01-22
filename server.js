@@ -527,11 +527,23 @@ app.post("/api/claim", async (req, res) => {
       const { blockhash } = await solanaConnection.getLatestBlockhash('confirmed');
       transaction.recentBlockhash = blockhash;
 
+      // Check vault SOL balance before sending
+      const vaultBalance = await solanaConnection.getBalance(vaultKeypair.publicKey);
+      console.log(`   Vault SOL balance: ${vaultBalance / 1_000_000_000} SOL`);
+
+      if (vaultBalance < 5000) {
+        throw new Error(`Vault has insufficient SOL for fees. Balance: ${vaultBalance / 1_000_000_000} SOL`);
+      }
+
       txSignature = await sendAndConfirmTransaction(
         solanaConnection,
         transaction,
         [vaultKeypair],
-        { commitment: 'confirmed' }
+        {
+          commitment: 'confirmed',
+          skipPreflight: true,  // Skip preflight simulation
+          preflightCommitment: 'confirmed'
+        }
       );
 
       console.log(`✅ Transfer successful! TX: ${txSignature}`);
