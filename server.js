@@ -19,8 +19,12 @@ const SCAN_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 const ADMIN_WALLET = process.env.ADMIN_WALLET || "6SxLVfFovSjR2LAFcJ5wfT6RFjc8GxsscRekGnLq8BMe";
 const DEBUG_MODE = process.env.DEBUG_MODE === "true"; // Set to true for verbose logging
 
-// Solana configuration - Use Helius RPC for better performance
-const SOLANA_RPC = process.env.SOLANA_RPC || "https://mainnet.helius-rpc.com/?api-key=1be26e68-fd63-42bf-8f62-d7d79b2f07cf";
+// Solana configuration - SOLANA_RPC must be set in environment
+const SOLANA_RPC = process.env.SOLANA_RPC;
+if (!SOLANA_RPC) {
+  console.error("❌ SOLANA_RPC environment variable not set!");
+  process.exit(1);
+}
 const USDC_MINT = process.env.USDC_MINT || "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const VAULT_ADDRESS = process.env.VAULT_ADDRESS || "HXAV7ysEaCH8imtGLU7A8c51tbP34NT9t8L3zvfR8L3Q";
 
