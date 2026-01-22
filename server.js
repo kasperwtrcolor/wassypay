@@ -405,14 +405,21 @@ app.get("/api/claims", async (req, res) => {
     }
 
     // Get payments where user is recipient and not yet claimed
+    // Use LOWER() for case-insensitive match on sender username
     const rows = await db.all(
       `SELECT p.*, u.wallet_address as sender_wallet, u.is_delegated as sender_db_delegated
        FROM payments p
-       LEFT JOIN users u ON p.sender_username = u.x_username
-       WHERE p.recipient_username = ? AND p.status = 'pending' AND p.claimed_by IS NULL
+       LEFT JOIN users u ON LOWER(p.sender_username) = LOWER(u.x_username)
+       WHERE LOWER(p.recipient_username) = LOWER(?) AND p.status = 'pending' AND p.claimed_by IS NULL
        ORDER BY p.created_at DESC`,
       [handle]
     );
+
+    // Debug: List all users in DB for comparison
+    const allUsers = await db.all(`SELECT x_username, wallet_address FROM users`);
+    console.log(`📋 Fetching claims for @${handle}`);
+    console.log(`   Users in DB: ${allUsers.map(u => `@${u.x_username}(${u.wallet_address ? 'has wallet' : 'no wallet'})`).join(', ') || 'NONE'}`);
+    console.log(`   Found ${rows.length} pending claims`);
 
     // Enrich each claim with on-chain sender fund status
     const enrichedClaims = await Promise.all(rows.map(async (claim) => {
