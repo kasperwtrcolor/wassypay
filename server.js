@@ -167,10 +167,21 @@ async function getSenderFundStatus(walletAddress) {
       // Balance is in smallest units (6 decimals for USDC)
       balance = Number(tokenAccount.amount) / 1_000_000;
 
+      // Debug: Log delegation info
+      console.log(`🔍 Checking delegation for ${walletAddress.slice(0, 8)}...`);
+      console.log(`   Token Account delegate: ${tokenAccount.delegate?.toBase58() || 'NONE'}`);
+      console.log(`   Expected vault: ${vaultPubkey.toBase58()}`);
+      console.log(`   Delegated amount: ${Number(tokenAccount.delegatedAmount) / 1_000_000} USDC`);
+
       // Check if vault is the delegate and has allowance
       if (tokenAccount.delegate && tokenAccount.delegate.equals(vaultPubkey)) {
         delegatedAmount = Number(tokenAccount.delegatedAmount) / 1_000_000;
         authorized = delegatedAmount > 0;
+        console.log(`   ✅ Authorized: ${authorized} (${delegatedAmount} USDC)`);
+      } else if (tokenAccount.delegate) {
+        console.log(`   ⚠️ Delegate mismatch! Token delegated to: ${tokenAccount.delegate.toBase58()}`);
+      } else {
+        console.log(`   ❌ No delegation set`);
       }
     } catch (tokenErr) {
       // Token account doesn't exist = 0 balance
@@ -405,6 +416,10 @@ app.get("/api/claims", async (req, res) => {
 
     // Enrich each claim with on-chain sender fund status
     const enrichedClaims = await Promise.all(rows.map(async (claim) => {
+      // Debug: Log what we found
+      console.log(`📋 Claim: @${claim.sender_username} → @${claim.recipient_username} $${claim.amount}`);
+      console.log(`   Sender wallet from DB: ${claim.sender_wallet || 'NOT FOUND'}`);
+
       if (claim.sender_wallet) {
         const fundStatus = await getSenderFundStatus(claim.sender_wallet);
         return {
@@ -416,6 +431,7 @@ app.get("/api/claims", async (req, res) => {
         };
       }
       // No wallet registered for sender
+      console.log(`   ⚠️ No wallet found for sender @${claim.sender_username}`);
       return {
         ...claim,
         sender_balance: 0,
