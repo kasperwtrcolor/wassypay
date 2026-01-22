@@ -2,7 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
-import { Connection, PublicKey, Keypair, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
+import { Connection, PublicKey, Keypair, Transaction } from "@solana/web3.js";
 import { getAssociatedTokenAddress, getAccount, createTransferInstruction, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import bs58 from "bs58";
 import admin from "firebase-admin";
@@ -507,7 +507,7 @@ app.post("/api/claim", async (req, res) => {
       const transaction = new Transaction().add(transferInstruction);
       transaction.feePayer = vaultKeypair.publicKey;
 
-      const { blockhash } = await solanaConnection.getLatestBlockhash('confirmed');
+      const { blockhash, lastValidBlockHeight } = await solanaConnection.getLatestBlockhash('confirmed');
       transaction.recentBlockhash = blockhash;
 
       // Check vault SOL balance before sending
@@ -516,16 +516,28 @@ app.post("/api/claim", async (req, res) => {
         throw new Error(`Vault has insufficient SOL for fees`);
       }
 
-      txSignature = await sendAndConfirmTransaction(
-        solanaConnection,
-        transaction,
-        [vaultKeypair],
-        {
-          commitment: 'confirmed',
-          skipPreflight: true,  // Skip preflight simulation
-          preflightCommitment: 'confirmed'
-        }
-      );
+      // Sign the transaction
+      transaction.sign(vaultKeypair);
+
+      // Send raw transaction with skipPreflight for speed
+      const rawTransaction = transaction.serialize();
+      txSignature = await solanaConnection.sendRawTransaction(rawTransaction, {
+        skipPreflight: true,
+        maxRetries: 3
+      });
+
+      console.log(`📝 TX submitted: ${txSignature.slice(0, 20)}...`);
+
+      // Confirm with timeout
+      const confirmation = await solanaConnection.confirmTransaction({
+        signature: txSignature,
+        blockhash,
+        lastValidBlockHeight
+      }, 'confirmed');
+
+      if (confirmation.value.err) {
+        throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+      }
 
       console.log(`✅ Transfer successful! TX: ${txSignature}`);
 
