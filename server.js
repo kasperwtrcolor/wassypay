@@ -510,6 +510,7 @@ app.post("/api/claim", async (req, res) => {
       console.log(`📤 Initiating transfer: ${payment.amount} USDC`);
       console.log(`   From: ${senderPubkey.toBase58().slice(0, 8)}... (ATA: ${senderATA.toBase58().slice(0, 8)}...)`);
       console.log(`   To: ${recipientPubkey.toBase58().slice(0, 8)}... (ATA: ${recipientATA.toBase58().slice(0, 8)}...)`);
+      console.log(`   Fee Payer (Vault): ${vaultKeypair.publicKey.toBase58()}`);
 
       const transferInstruction = createTransferInstruction(
         senderATA,
