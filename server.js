@@ -4,8 +4,9 @@ import dotenv from "dotenv";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 import fetch from "node-fetch";
-import { Connection, PublicKey } from "@solana/web3.js";
-import { getAssociatedTokenAddress, getAccount } from "@solana/spl-token";
+import { Connection, PublicKey, Keypair, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
+import { getAssociatedTokenAddress, getAccount, createTransferInstruction, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import bs58 from "bs58";
 
 dotenv.config();
 const app = express();
@@ -21,10 +22,25 @@ const ADMIN_WALLET = process.env.ADMIN_WALLET || "6SxLVfFovSjR2LAFcJ5wfT6RFjc8Gx
 // Solana configuration
 const SOLANA_RPC = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
 const USDC_MINT = process.env.USDC_MINT || "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const VAULT_ADDRESS = process.env.VAULT_ADDRESS || "6SxLVfFovSjR2LAFcJ5wfT6RFjc8GxsscRekGnLq8BMe";
+const VAULT_ADDRESS = process.env.VAULT_ADDRESS || "HXAV7ysEaCH8imtGLU7A8c51tbP34NT9t8L3zvfR8L3Q";
 
 // Create Solana connection
 const solanaConnection = new Connection(SOLANA_RPC, "confirmed");
+
+// Load vault keypair for executing transfers
+// VAULT_PRIVATE_KEY should be a base58-encoded private key
+let vaultKeypair = null;
+if (process.env.VAULT_PRIVATE_KEY) {
+  try {
+    const secretKey = bs58.decode(process.env.VAULT_PRIVATE_KEY);
+    vaultKeypair = Keypair.fromSecretKey(secretKey);
+    console.log(`✅ Vault keypair loaded: ${vaultKeypair.publicKey.toBase58().slice(0, 8)}...`);
+  } catch (e) {
+    console.error("❌ Failed to load vault keypair:", e.message);
+  }
+} else {
+  console.warn("⚠️ VAULT_PRIVATE_KEY not set - transfers will be disabled");
+}
 
 let db;
 
@@ -492,13 +508,91 @@ app.post("/api/claim", async (req, res) => {
       });
     }
 
-    // Mark as claimed (in a real implementation, this would trigger the on-chain transfer)
+    // ===== EXECUTE ON-CHAIN USDC TRANSFER =====
+    let txSignature = null;
+
+    if (!vaultKeypair) {
+      return res.status(500).json({
+        success: false,
+        error: "Server not configured for transfers (vault keypair missing)"
+      });
+    }
+
+    try {
+      // Get sender wallet
+      const senderUser = await db.get(
+        `SELECT wallet_address FROM users WHERE x_username = ?`,
+        [payment.sender_username]
+      );
+
+      if (!senderUser?.wallet_address) {
+        return res.status(400).json({
+          success: false,
+          error: "Sender wallet not found"
+        });
+      }
+
+      const senderPubkey = new PublicKey(senderUser.wallet_address);
+      const recipientPubkey = new PublicKey(wallet);
+      const usdcMint = new PublicKey(USDC_MINT);
+
+      // Get Associated Token Accounts
+      const senderATA = await getAssociatedTokenAddress(usdcMint, senderPubkey);
+      const recipientATA = await getAssociatedTokenAddress(usdcMint, recipientPubkey);
+
+      // Convert amount to USDC decimals (6 decimals)
+      const transferAmount = Math.floor(payment.amount * 1_000_000);
+
+      console.log(`📤 Initiating transfer: ${payment.amount} USDC`);
+      console.log(`   From: ${senderPubkey.toBase58().slice(0, 8)}... (ATA: ${senderATA.toBase58().slice(0, 8)}...)`);
+      console.log(`   To: ${recipientPubkey.toBase58().slice(0, 8)}... (ATA: ${recipientATA.toBase58().slice(0, 8)}...)`);
+
+      // Create transfer instruction
+      // Note: This uses the delegation where the sender has approved the vault to transfer on their behalf
+      const transferInstruction = createTransferInstruction(
+        senderATA,           // source
+        recipientATA,        // destination
+        vaultKeypair.publicKey, // owner/delegate (vault is the delegate)
+        transferAmount,      // amount
+        [],                  // multiSigners
+        TOKEN_PROGRAM_ID
+      );
+
+      // Build transaction
+      const transaction = new Transaction().add(transferInstruction);
+      transaction.feePayer = vaultKeypair.publicKey;
+
+      // Get recent blockhash
+      const { blockhash, lastValidBlockHeight } = await solanaConnection.getLatestBlockhash('confirmed');
+      transaction.recentBlockhash = blockhash;
+
+      // Sign and send transaction
+      txSignature = await sendAndConfirmTransaction(
+        solanaConnection,
+        transaction,
+        [vaultKeypair],
+        { commitment: 'confirmed' }
+      );
+
+      console.log(`✅ Transfer successful! TX: ${txSignature}`);
+
+    } catch (transferError) {
+      console.error(`❌ On-chain transfer failed:`, transferError);
+      return res.status(500).json({
+        success: false,
+        error: `Transfer failed: ${transferError.message}`,
+        details: transferError.logs || null
+      });
+    }
+
+    // Mark as claimed with transaction signature
     await db.run(
       `UPDATE payments SET 
         status = 'completed',
-        claimed_by = ?
+        claimed_by = ?,
+        tx_signature = ?
        WHERE tweet_id = ?`,
-      [wallet, tweet_id]
+      [wallet, txSignature, tweet_id]
     );
 
     // Update user stats
@@ -525,7 +619,8 @@ app.post("/api/claim", async (req, res) => {
       success: true,
       message: "Payment claimed successfully",
       amount: payment.amount,
-      sender: payment.sender_username
+      sender: payment.sender_username,
+      txSignature: txSignature
     });
   } catch (e) {
     console.error("/api/claim error:", e);
