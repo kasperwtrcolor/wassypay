@@ -32,7 +32,8 @@ if (process.env.VAULT_PRIVATE_KEY) {
   try {
     const secretKey = bs58.decode(process.env.VAULT_PRIVATE_KEY);
     vaultKeypair = Keypair.fromSecretKey(secretKey);
-    console.log(`✅ Vault keypair loaded: ${vaultKeypair.publicKey.toBase58().slice(0, 8)}...`);
+    console.log(`✅ Vault keypair loaded: ${vaultKeypair.publicKey.toBase58()}`);
+    console.log(`   Make sure this address has SOL for fees!`);
   } catch (e) {
     console.error("❌ Failed to load vault keypair:", e.message);
   }
