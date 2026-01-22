@@ -1,12 +1,11 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import sqlite3 from "sqlite3";
-import { open } from "sqlite";
 import fetch from "node-fetch";
 import { Connection, PublicKey, Keypair, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
 import { getAssociatedTokenAddress, getAccount, createTransferInstruction, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import bs58 from "bs58";
+import admin from "firebase-admin";
 
 dotenv.config();
 const app = express();
@@ -28,7 +27,6 @@ const VAULT_ADDRESS = process.env.VAULT_ADDRESS || "HXAV7ysEaCH8imtGLU7A8c51tbP3
 const solanaConnection = new Connection(SOLANA_RPC, "confirmed");
 
 // Load vault keypair for executing transfers
-// VAULT_PRIVATE_KEY should be a base58-encoded private key
 let vaultKeypair = null;
 if (process.env.VAULT_PRIVATE_KEY) {
   try {
@@ -42,91 +40,45 @@ if (process.env.VAULT_PRIVATE_KEY) {
   console.warn("⚠️ VAULT_PRIVATE_KEY not set - transfers will be disabled");
 }
 
-let db;
+// ===== FIREBASE SETUP =====
+let firestore;
+try {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || "{}");
+  if (serviceAccount.project_id) {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    firestore = admin.firestore();
+    console.log("✅ Firebase initialized");
+  } else {
+    console.error("❌ FIREBASE_SERVICE_ACCOUNT not configured properly");
+    process.exit(1);
+  }
+} catch (e) {
+  console.error("❌ Failed to initialize Firebase:", e.message);
+  process.exit(1);
+}
 
-// ===== DB SETUP =====
-(async () => {
-  db = await open({
-    filename: process.env.DB_PATH || "./wassy.db",
-    driver: sqlite3.Database
-  });
+// Firestore collections
+const usersCollection = firestore.collection("backend_users");
+const paymentsCollection = firestore.collection("payments");
+const metaCollection = firestore.collection("meta");
 
-  // Users table - stores registered users
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      x_username TEXT UNIQUE NOT NULL,
-      x_user_id TEXT,
-      wallet_address TEXT,
-      is_delegated INTEGER DEFAULT 0,
-      delegation_amount REAL DEFAULT 0,
-      delegation_signature TEXT,
-      total_deposited REAL DEFAULT 0,
-      total_sent REAL DEFAULT 0,
-      total_claimed REAL DEFAULT 0,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-
-  // Payments table - stores all payment records from tweets
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS payments (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      tweet_id TEXT UNIQUE,
-      sender TEXT NOT NULL,
-      sender_username TEXT,
-      recipient TEXT NOT NULL,
-      recipient_username TEXT,
-      amount REAL NOT NULL,
-      status TEXT DEFAULT 'pending',
-      claimed_by TEXT,
-      tx_signature TEXT,
-      error_message TEXT,
-      tweet_url TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-
-  // Meta table for key-value storage
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS meta (
-      key TEXT PRIMARY KEY,
-      value TEXT
-    );
-  `);
-
-  // Fund deposits tracking
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS fund_deposits (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      handle TEXT,
-      amount REAL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-
-  console.log("✅ Database initialized");
-
-  // Run scan at boot
+// Run scan at boot
+setTimeout(() => {
   runScheduledTweetCheck();
-
   // Schedule every 30 minutes
   setInterval(runScheduledTweetCheck, SCAN_INTERVAL_MS);
-})();
+}, 2000);
 
 // ===== HELPERS =====
 async function upsertMeta(key, value) {
-  await db.run(
-    `INSERT INTO meta (key, value) VALUES (?, ?)
-     ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
-    [key, String(value)]
-  );
+  await metaCollection.doc(key).set({ value: String(value) }, { merge: true });
 }
 
 async function getMeta(key) {
-  const row = await db.get(`SELECT value FROM meta WHERE key = ?`, [key]);
-  return row?.value ?? null;
+  const doc = await metaCollection.doc(key).get();
+  return doc.exists ? doc.data().value : null;
 }
 
 function normalizeHandle(h) {
@@ -136,12 +88,20 @@ function normalizeHandle(h) {
 
 async function ensureUser(x_username) {
   const handle = normalizeHandle(x_username);
-  let user = await db.get(`SELECT * FROM users WHERE x_username = ?`, [handle]);
-  if (!user) {
-    await db.run(`INSERT INTO users (x_username) VALUES (?)`, [handle]);
-    user = await db.get(`SELECT * FROM users WHERE x_username = ?`, [handle]);
+  const userRef = usersCollection.doc(handle);
+  const doc = await userRef.get();
+
+  if (!doc.exists) {
+    const newUser = {
+      x_username: handle,
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+      updated_at: admin.firestore.FieldValue.serverTimestamp()
+    };
+    await userRef.set(newUser);
+    return { x_username: handle, ...newUser };
   }
-  return user;
+
+  return { x_username: handle, ...doc.data() };
 }
 
 // Get sender's on-chain USDC balance and authorization status
@@ -155,7 +115,6 @@ async function getSenderFundStatus(walletAddress) {
     const usdcMintPubkey = new PublicKey(USDC_MINT);
     const vaultPubkey = new PublicKey(VAULT_ADDRESS);
 
-    // Get sender's USDC token account
     const ata = await getAssociatedTokenAddress(usdcMintPubkey, walletPubkey);
 
     let balance = 0;
@@ -164,16 +123,13 @@ async function getSenderFundStatus(walletAddress) {
 
     try {
       const tokenAccount = await getAccount(solanaConnection, ata);
-      // Balance is in smallest units (6 decimals for USDC)
       balance = Number(tokenAccount.amount) / 1_000_000;
 
-      // Debug: Log delegation info
       console.log(`🔍 Checking delegation for ${walletAddress.slice(0, 8)}...`);
       console.log(`   Token Account delegate: ${tokenAccount.delegate?.toBase58() || 'NONE'}`);
       console.log(`   Expected vault: ${vaultPubkey.toBase58()}`);
       console.log(`   Delegated amount: ${Number(tokenAccount.delegatedAmount) / 1_000_000} USDC`);
 
-      // Check if vault is the delegate and has allowance
       if (tokenAccount.delegate && tokenAccount.delegate.equals(vaultPubkey)) {
         delegatedAmount = Number(tokenAccount.delegatedAmount) / 1_000_000;
         authorized = delegatedAmount > 0;
@@ -184,7 +140,6 @@ async function getSenderFundStatus(walletAddress) {
         console.log(`   ❌ No delegation set`);
       }
     } catch (tokenErr) {
-      // Token account doesn't exist = 0 balance
       console.log(`Token account not found for ${walletAddress}`);
     }
 
@@ -201,31 +156,42 @@ async function recordPayment(sender, recipient, amount, tweet_id) {
     const r = normalizeHandle(recipient);
     const a = Number(amount);
 
-    // Skip if same tweet already exists
-    const existingByTweet = await db.get(`SELECT * FROM payments WHERE tweet_id = ?`, [tweet_id]);
-    if (existingByTweet) {
+    // Check if tweet already exists
+    const existingDoc = await paymentsCollection.doc(tweet_id).get();
+    if (existingDoc.exists) {
       console.log(`⛔ Tweet ${tweet_id} already recorded — skipping`);
       return;
     }
 
-    // Skip logical duplicates (same sender, recipient, amount in last 2h)
-    const dup = await db.get(
-      `SELECT * FROM payments 
-       WHERE sender = ? AND recipient = ? AND amount = ? 
-         AND created_at >= datetime('now', '-120 minutes')`,
-      [s, r, a]
-    );
-    if (dup) {
+    // Check for duplicates (same sender, recipient, amount in last 2h)
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    const dupQuery = await paymentsCollection
+      .where("sender_username", "==", s)
+      .where("recipient_username", "==", r)
+      .where("amount", "==", a)
+      .where("created_at", ">=", twoHoursAgo)
+      .limit(1)
+      .get();
+
+    if (!dupQuery.empty) {
       console.log(`⛔ Duplicate detected for @${s} → @${r} $${a} — skipping`);
       return;
     }
 
     // Insert new payment
-    await db.run(
-      `INSERT INTO payments (tweet_id, sender, sender_username, recipient, recipient_username, amount, status, tweet_url)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`,
-      [tweet_id, s, s, r, r, a, `https://twitter.com/i/status/${tweet_id}`]
-    );
+    await paymentsCollection.doc(tweet_id).set({
+      tweet_id,
+      sender: s,
+      sender_username: s,
+      recipient: r,
+      recipient_username: r,
+      amount: a,
+      status: "pending",
+      claimed_by: null,
+      tx_signature: null,
+      tweet_url: `https://twitter.com/i/status/${tweet_id}`,
+      created_at: admin.firestore.FieldValue.serverTimestamp()
+    });
 
     // Ensure both users exist
     await ensureUser(s);
@@ -243,29 +209,24 @@ function parsePaymentCommand(text) {
 
   // Format A: send @user $5
   const a = t.match(/send\s+@(\w+)\s*\$?\s*([\d.]+)/i);
-  if (a) {
-    return { recipient: a[1], amount: parseFloat(a[2]) };
-  }
+  if (a) return { recipient: a[1], amount: parseFloat(a[2]) };
 
   // Format B: send $5 to @user
-  const b = t.match(/send\s*\$?\s*([\d.]+)\s*(?:to)?\s*@(\w+)/i);
-  if (b) {
-    return { recipient: b[2], amount: parseFloat(b[1]) };
-  }
+  const b = t.match(/send\s*\$?\s*([\d.]+)\s+to\s+@(\w+)/i);
+  if (b) return { recipient: b[2], amount: parseFloat(b[1]) };
+
+  // Format C: pay @user $5
+  const c = t.match(/pay\s+@(\w+)\s*\$?\s*([\d.]+)/i);
+  if (c) return { recipient: c[1], amount: parseFloat(c[2]) };
 
   return null;
 }
 
-// ===== ROUTES =====
-app.get("/", (_, res) => {
-  res.send("🟢 WASSY PAY backend active — 30-min X scans + tweet-based payment logging");
-});
+// ===== API ROUTES =====
 
-app.get("/health", (_, res) => {
-  res.json({ ok: true, time: new Date().toISOString() });
+app.get("/", (req, res) => {
+  res.json({ status: "ok", name: "WASSY API", version: "2.0-firebase" });
 });
-
-// ===== USER AUTHENTICATION =====
 
 // POST /api/login - Register or login user
 app.post("/api/login", async (req, res) => {
@@ -276,19 +237,18 @@ app.post("/api/login", async (req, res) => {
     }
 
     const handle = normalizeHandle(x_username);
+    const userRef = usersCollection.doc(handle);
 
     // Upsert user
-    await db.run(
-      `INSERT INTO users (x_username, x_user_id, wallet_address, updated_at)
-       VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-       ON CONFLICT(x_username) DO UPDATE SET 
-         x_user_id = COALESCE(excluded.x_user_id, x_user_id),
-         wallet_address = COALESCE(excluded.wallet_address, wallet_address),
-         updated_at = CURRENT_TIMESTAMP`,
-      [handle, x_user_id || null, wallet_address || null]
-    );
+    await userRef.set({
+      x_username: handle,
+      x_user_id: x_user_id || null,
+      wallet_address: wallet_address || null,
+      updated_at: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
 
-    const user = await db.get(`SELECT * FROM users WHERE x_username = ?`, [handle]);
+    const userDoc = await userRef.get();
+    const user = userDoc.data() || {};
 
     console.log(`👤 User logged in: @${handle} (wallet: ${wallet_address?.slice(0, 8)}...)`);
 
@@ -312,18 +272,20 @@ app.post("/api/authorize", async (req, res) => {
       return res.status(400).json({ success: false, message: "wallet and amount required" });
     }
 
-    await db.run(
-      `UPDATE users SET 
-        is_delegated = 1,
-        delegation_amount = ?,
-        delegation_signature = ?,
-        updated_at = CURRENT_TIMESTAMP
-       WHERE wallet_address = ?`,
-      [Number(amount), signature || null, wallet]
-    );
+    // Find user by wallet address
+    const usersQuery = await usersCollection.where("wallet_address", "==", wallet).limit(1).get();
+
+    if (!usersQuery.empty) {
+      const userDoc = usersQuery.docs[0];
+      await userDoc.ref.update({
+        is_delegated: true,
+        delegation_amount: Number(amount),
+        delegation_signature: signature || null,
+        updated_at: admin.firestore.FieldValue.serverTimestamp()
+      });
+    }
 
     console.log(`🔐 Authorization recorded: ${wallet.slice(0, 8)}... for $${amount}`);
-
     res.json({ success: true, message: "Authorization recorded" });
   } catch (e) {
     console.error("/api/authorize error:", e);
@@ -341,53 +303,36 @@ app.get("/api/payments/:username", async (req, res) => {
       return res.status(400).json({ success: false, message: "username required" });
     }
 
-    const rows = await db.all(
-      `SELECT * FROM payments 
-       WHERE sender_username = ? OR recipient_username = ?
-       ORDER BY created_at DESC
-       LIMIT 100`,
-      [handle, handle]
-    );
+    // Get payments where user is sender
+    const sentQuery = await paymentsCollection
+      .where("sender_username", "==", handle)
+      .orderBy("created_at", "desc")
+      .limit(50)
+      .get();
 
-    res.json({ success: true, payments: rows });
-  } catch (e) {
-    console.error("/api/payments/:username error:", e);
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
+    // Get payments where user is recipient
+    const receivedQuery = await paymentsCollection
+      .where("recipient_username", "==", handle)
+      .orderBy("created_at", "desc")
+      .limit(50)
+      .get();
 
-// GET /api/payments - Query payments (existing endpoint)
-app.get("/api/payments", async (req, res) => {
-  try {
-    const { id, tweet_id, recipient, handle, status } = req.query;
+    const payments = [];
+    sentQuery.forEach(doc => payments.push({ id: doc.id, ...doc.data() }));
+    receivedQuery.forEach(doc => {
+      if (!payments.find(p => p.id === doc.id)) {
+        payments.push({ id: doc.id, ...doc.data() });
+      }
+    });
 
-    const singleKey = id || tweet_id;
-    if (singleKey) {
-      const row = await db.get(`SELECT * FROM payments WHERE tweet_id = ?`, [String(singleKey)]);
-      if (!row) return res.json({ success: false, message: "not_found" });
-      return res.json({ success: true, payments: [row] });
-    }
+    // Sort by created_at
+    payments.sort((a, b) => {
+      const aTime = a.created_at?.toMillis?.() || 0;
+      const bTime = b.created_at?.toMillis?.() || 0;
+      return bTime - aTime;
+    });
 
-    const where = [];
-    const args = [];
-    if (recipient) {
-      where.push(`recipient_username = ?`);
-      args.push(normalizeHandle(recipient));
-    }
-    if (handle) {
-      where.push(`(sender_username = ? OR recipient_username = ?)`);
-      args.push(normalizeHandle(handle), normalizeHandle(handle));
-    }
-    if (status) {
-      where.push(`status = ?`);
-      args.push(status);
-    }
-
-    const sql = `SELECT * FROM payments ${where.length ? "WHERE " + where.join(" AND ") : ""
-      } ORDER BY created_at DESC LIMIT 100`;
-
-    const rows = await db.all(sql, args);
-    res.json({ success: true, payments: rows });
+    res.json({ success: true, payments: payments.slice(0, 100) });
   } catch (e) {
     console.error("/api/payments error:", e);
     res.status(500).json({ success: false, message: e.message });
@@ -404,43 +349,49 @@ app.get("/api/claims", async (req, res) => {
       return res.status(400).json({ success: false, message: "handle required" });
     }
 
-    // Get payments where user is recipient and not yet claimed
-    // Use LOWER() for case-insensitive match on sender username
-    const rows = await db.all(
-      `SELECT p.*, u.wallet_address as sender_wallet, u.is_delegated as sender_db_delegated
-       FROM payments p
-       LEFT JOIN users u ON LOWER(p.sender_username) = LOWER(u.x_username)
-       WHERE LOWER(p.recipient_username) = LOWER(?) AND p.status = 'pending' AND p.claimed_by IS NULL
-       ORDER BY p.created_at DESC`,
-      [handle]
-    );
+    // Get pending payments where user is recipient
+    const claimsQuery = await paymentsCollection
+      .where("recipient_username", "==", handle)
+      .where("status", "==", "pending")
+      .orderBy("created_at", "desc")
+      .get();
 
-    // Debug: List all users in DB for comparison
-    const allUsers = await db.all(`SELECT x_username, wallet_address FROM users`);
+    const claims = [];
+    claimsQuery.forEach(doc => claims.push({ id: doc.id, ...doc.data() }));
+
+    // Debug: List all users
+    const usersSnapshot = await usersCollection.get();
+    const allUsers = [];
+    usersSnapshot.forEach(doc => allUsers.push(doc.data()));
     console.log(`📋 Fetching claims for @${handle}`);
     console.log(`   Users in DB: ${allUsers.map(u => `@${u.x_username}(${u.wallet_address ? 'has wallet' : 'no wallet'})`).join(', ') || 'NONE'}`);
-    console.log(`   Found ${rows.length} pending claims`);
+    console.log(`   Found ${claims.length} pending claims`);
 
-    // Enrich each claim with on-chain sender fund status
-    const enrichedClaims = await Promise.all(rows.map(async (claim) => {
-      // Debug: Log what we found
+    // Enrich with sender fund status
+    const enrichedClaims = await Promise.all(claims.map(async (claim) => {
+      // Get sender's wallet from Firestore
+      const senderDoc = await usersCollection.doc(claim.sender_username).get();
+      const senderWallet = senderDoc.exists ? senderDoc.data().wallet_address : null;
+
       console.log(`📋 Claim: @${claim.sender_username} → @${claim.recipient_username} $${claim.amount}`);
-      console.log(`   Sender wallet from DB: ${claim.sender_wallet || 'NOT FOUND'}`);
+      console.log(`   Sender wallet from DB: ${senderWallet || 'NOT FOUND'}`);
 
-      if (claim.sender_wallet) {
-        const fundStatus = await getSenderFundStatus(claim.sender_wallet);
+      if (senderWallet) {
+        const fundStatus = await getSenderFundStatus(senderWallet);
         return {
           ...claim,
+          sender_wallet: senderWallet,
           sender_balance: fundStatus.balance,
           sender_delegated_amount: fundStatus.delegatedAmount,
           sender_authorized: fundStatus.authorized,
           sender_can_pay: fundStatus.authorized && fundStatus.delegatedAmount >= claim.amount
         };
       }
-      // No wallet registered for sender
+
       console.log(`   ⚠️ No wallet found for sender @${claim.sender_username}`);
       return {
         ...claim,
+        sender_wallet: null,
         sender_balance: 0,
         sender_delegated_amount: 0,
         sender_authorized: false,
@@ -465,69 +416,71 @@ app.post("/api/claim", async (req, res) => {
 
     const handle = normalizeHandle(username);
 
-    // Check if payment exists and is claimable
-    const payment = await db.get(
-      `SELECT p.*, u.wallet_address as sender_wallet
-       FROM payments p
-       LEFT JOIN users u ON p.sender_username = u.x_username
-       WHERE p.tweet_id = ? AND p.recipient_username = ?`,
-      [tweet_id, handle]
-    );
-
-    if (!payment) {
+    // Get payment from Firestore
+    const paymentDoc = await paymentsCollection.doc(tweet_id).get();
+    if (!paymentDoc.exists) {
       return res.status(404).json({ success: false, error: "Payment not found" });
+    }
+
+    const payment = paymentDoc.data();
+
+    if (payment.recipient_username !== handle) {
+      return res.status(403).json({ success: false, error: "You are not the recipient of this payment" });
     }
 
     if (payment.status === 'completed' || payment.claimed_by) {
       return res.status(400).json({ success: false, error: "Payment already claimed" });
     }
 
-    // Verify sender has sufficient authorized funds on-chain
-    if (payment.sender_wallet) {
-      const fundStatus = await getSenderFundStatus(payment.sender_wallet);
+    // Get sender's wallet
+    const senderDoc = await usersCollection.doc(payment.sender_username).get();
+    const senderWallet = senderDoc.exists ? senderDoc.data().wallet_address : null;
 
-      if (!fundStatus.authorized) {
-        return res.status(400).json({
-          success: false,
-          error: "Sender has not authorized the vault. Ask them to authorize first.",
-          sender_status: {
-            authorized: false,
-            balance: fundStatus.balance,
-            delegated_amount: fundStatus.delegatedAmount
-          }
-        });
-      }
-
-      if (fundStatus.delegatedAmount < payment.amount) {
-        return res.status(400).json({
-          success: false,
-          error: `Sender's authorized amount ($${fundStatus.delegatedAmount.toFixed(2)}) is less than payment amount ($${payment.amount}).`,
-          sender_status: {
-            authorized: true,
-            balance: fundStatus.balance,
-            delegated_amount: fundStatus.delegatedAmount,
-            required: payment.amount
-          }
-        });
-      }
-
-      if (fundStatus.balance < payment.amount) {
-        return res.status(400).json({
-          success: false,
-          error: `Sender's USDC balance ($${fundStatus.balance.toFixed(2)}) is less than payment amount ($${payment.amount}).`,
-          sender_status: {
-            authorized: true,
-            balance: fundStatus.balance,
-            delegated_amount: fundStatus.delegatedAmount,
-            required: payment.amount
-          }
-        });
-      }
-    } else {
-      // Sender hasn't registered their wallet
+    if (!senderWallet) {
       return res.status(400).json({
         success: false,
         error: "Sender has not registered a wallet. They need to log in and fund their account."
+      });
+    }
+
+    // Verify sender has sufficient authorized funds on-chain
+    const fundStatus = await getSenderFundStatus(senderWallet);
+
+    if (!fundStatus.authorized) {
+      return res.status(400).json({
+        success: false,
+        error: "Sender has not authorized the vault. Ask them to authorize first.",
+        sender_status: {
+          authorized: false,
+          balance: fundStatus.balance,
+          delegated_amount: fundStatus.delegatedAmount
+        }
+      });
+    }
+
+    if (fundStatus.delegatedAmount < payment.amount) {
+      return res.status(400).json({
+        success: false,
+        error: `Sender's authorized amount ($${fundStatus.delegatedAmount.toFixed(2)}) is less than payment amount ($${payment.amount}).`,
+        sender_status: {
+          authorized: true,
+          balance: fundStatus.balance,
+          delegated_amount: fundStatus.delegatedAmount,
+          required: payment.amount
+        }
+      });
+    }
+
+    if (fundStatus.balance < payment.amount) {
+      return res.status(400).json({
+        success: false,
+        error: `Sender's USDC balance ($${fundStatus.balance.toFixed(2)}) is less than payment amount ($${payment.amount}).`,
+        sender_status: {
+          authorized: true,
+          balance: fundStatus.balance,
+          delegated_amount: fundStatus.delegatedAmount,
+          required: payment.amount
+        }
       });
     }
 
@@ -542,54 +495,34 @@ app.post("/api/claim", async (req, res) => {
     }
 
     try {
-      // Get sender wallet
-      const senderUser = await db.get(
-        `SELECT wallet_address FROM users WHERE x_username = ?`,
-        [payment.sender_username]
-      );
-
-      if (!senderUser?.wallet_address) {
-        return res.status(400).json({
-          success: false,
-          error: "Sender wallet not found"
-        });
-      }
-
-      const senderPubkey = new PublicKey(senderUser.wallet_address);
+      const senderPubkey = new PublicKey(senderWallet);
       const recipientPubkey = new PublicKey(wallet);
       const usdcMint = new PublicKey(USDC_MINT);
 
-      // Get Associated Token Accounts
       const senderATA = await getAssociatedTokenAddress(usdcMint, senderPubkey);
       const recipientATA = await getAssociatedTokenAddress(usdcMint, recipientPubkey);
 
-      // Convert amount to USDC decimals (6 decimals)
       const transferAmount = Math.floor(payment.amount * 1_000_000);
 
       console.log(`📤 Initiating transfer: ${payment.amount} USDC`);
       console.log(`   From: ${senderPubkey.toBase58().slice(0, 8)}... (ATA: ${senderATA.toBase58().slice(0, 8)}...)`);
       console.log(`   To: ${recipientPubkey.toBase58().slice(0, 8)}... (ATA: ${recipientATA.toBase58().slice(0, 8)}...)`);
 
-      // Create transfer instruction
-      // Note: This uses the delegation where the sender has approved the vault to transfer on their behalf
       const transferInstruction = createTransferInstruction(
-        senderATA,           // source
-        recipientATA,        // destination
-        vaultKeypair.publicKey, // owner/delegate (vault is the delegate)
-        transferAmount,      // amount
-        [],                  // multiSigners
+        senderATA,
+        recipientATA,
+        vaultKeypair.publicKey,
+        transferAmount,
+        [],
         TOKEN_PROGRAM_ID
       );
 
-      // Build transaction
       const transaction = new Transaction().add(transferInstruction);
       transaction.feePayer = vaultKeypair.publicKey;
 
-      // Get recent blockhash
-      const { blockhash, lastValidBlockHeight } = await solanaConnection.getLatestBlockhash('confirmed');
+      const { blockhash } = await solanaConnection.getLatestBlockhash('confirmed');
       transaction.recentBlockhash = blockhash;
 
-      // Sign and send transaction
       txSignature = await sendAndConfirmTransaction(
         solanaConnection,
         transaction,
@@ -608,33 +541,27 @@ app.post("/api/claim", async (req, res) => {
       });
     }
 
-    // Mark as claimed with transaction signature
-    await db.run(
-      `UPDATE payments SET 
-        status = 'completed',
-        claimed_by = ?,
-        tx_signature = ?
-       WHERE tweet_id = ?`,
-      [wallet, txSignature, tweet_id]
-    );
+    // Update payment in Firestore
+    await paymentsCollection.doc(tweet_id).update({
+      status: "completed",
+      claimed_by: wallet,
+      tx_signature: txSignature,
+      claimed_at: admin.firestore.FieldValue.serverTimestamp()
+    });
 
-    // Update user stats
-    await db.run(
-      `UPDATE users SET 
-        total_claimed = total_claimed + ?,
-        updated_at = CURRENT_TIMESTAMP
-       WHERE x_username = ?`,
-      [payment.amount, handle]
-    );
+    // Update recipient stats
+    const recipientRef = usersCollection.doc(handle);
+    await recipientRef.set({
+      total_claimed: admin.firestore.FieldValue.increment(payment.amount),
+      updated_at: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
 
     // Update sender stats
-    await db.run(
-      `UPDATE users SET 
-        total_sent = total_sent + ?,
-        updated_at = CURRENT_TIMESTAMP
-       WHERE x_username = ?`,
-      [payment.amount, payment.sender_username]
-    );
+    const senderRef = usersCollection.doc(payment.sender_username);
+    await senderRef.set({
+      total_sent: admin.firestore.FieldValue.increment(payment.amount),
+      updated_at: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
 
     console.log(`💰 Payment claimed: @${payment.sender_username} → @${handle} $${payment.amount}`);
 
@@ -643,7 +570,7 @@ app.post("/api/claim", async (req, res) => {
       message: "Payment claimed successfully",
       amount: payment.amount,
       sender: payment.sender_username,
-      txSignature: txSignature
+      txSignature
     });
   } catch (e) {
     console.error("/api/claim error:", e);
@@ -661,44 +588,45 @@ app.post("/api/deposit", async (req, res) => {
     }
 
     const normalizedHandle = normalizeHandle(handle);
+    const userRef = usersCollection.doc(normalizedHandle);
 
-    await db.run(
-      `INSERT INTO fund_deposits (handle, amount, created_at)
-       VALUES (?, ?, CURRENT_TIMESTAMP)`,
-      [normalizedHandle, amount]
-    );
+    await userRef.set({
+      total_deposited: admin.firestore.FieldValue.increment(Number(amount)),
+      updated_at: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
 
-    // Update user's total deposited
-    await db.run(
-      `UPDATE users SET 
-        total_deposited = total_deposited + ?,
-        updated_at = CURRENT_TIMESTAMP
-       WHERE x_username = ?`,
-      [Number(amount), normalizedHandle]
-    );
-
-    console.log(`💰 Deposit recorded: ${handle} +${amount} USDC`);
+    console.log(`💰 Deposit: @${normalizedHandle} +$${amount}`);
     res.json({ success: true, message: "Deposit recorded" });
   } catch (e) {
-    console.error("/api/deposit error:", e.message);
+    console.error("/api/deposit error:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ===== FUND STATUS CHECK =====
+
+app.get("/api/check-fund-status", async (req, res) => {
+  try {
+    const wallet = req.query.wallet;
+    if (!wallet) {
+      return res.status(400).json({ success: false, message: "wallet required" });
+    }
+
+    const status = await getSenderFundStatus(wallet);
+    res.json({ success: true, ...status });
+  } catch (e) {
+    console.error("/api/check-fund-status error:", e);
     res.status(500).json({ success: false, message: e.message });
   }
 });
 
 // ===== ADMIN =====
 
-// GET /api/admin/users - Get all users (admin only)
 app.get("/api/admin/users", async (req, res) => {
   try {
-    // In production, add proper authentication here
-    const users = await db.all(
-      `SELECT x_username, wallet_address, is_delegated, delegation_amount,
-              total_deposited, total_sent, total_claimed, created_at
-       FROM users
-       ORDER BY (total_deposited + total_sent + total_claimed) DESC
-       LIMIT 100`
-    );
-
+    const usersSnapshot = await usersCollection.limit(100).get();
+    const users = [];
+    usersSnapshot.forEach(doc => users.push({ id: doc.id, ...doc.data() }));
     res.json({ success: true, users });
   } catch (e) {
     console.error("/api/admin/users error:", e);
@@ -706,7 +634,6 @@ app.get("/api/admin/users", async (req, res) => {
   }
 });
 
-// GET /api/rescan - Trigger manual tweet scan
 app.get("/api/rescan", async (req, res) => {
   await runScheduledTweetCheck();
   res.json({ success: true, message: "Manual rescan triggered" });
@@ -763,13 +690,11 @@ async function runScheduledTweetCheck() {
     for (const tweet of data.data) {
       const text = (tweet.text || "").toLowerCase();
 
-      // Skip manual RT-style copies
       if (text.startsWith("rt ") || text.includes(" rt @") || text.includes("\nrt ")) {
         console.log(`⏭ Skipping manual RT-style tweet ${tweet.id}`);
         continue;
       }
 
-      // Skip if tweet references another as retweet/quote
       if (tweet.referenced_tweets && Array.isArray(tweet.referenced_tweets)) {
         const isRef = tweet.referenced_tweets.some(r => r.type === "retweeted" || r.type === "quoted");
         if (isRef) {
@@ -778,7 +703,6 @@ async function runScheduledTweetCheck() {
         }
       }
 
-      // Parse payment command
       const parsed = parsePaymentCommand(tweet.text || "");
       if (parsed && parsed.recipient && Number.isFinite(parsed.amount)) {
         const sender = users[tweet.author_id] || tweet.author_id || "unknown";
