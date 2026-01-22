@@ -66,9 +66,11 @@ const metaCollection = firestore.collection("meta");
 
 // Run scan at boot
 setTimeout(() => {
+  console.log("🕐 Starting initial tweet scan...");
   runScheduledTweetCheck();
   // Schedule every 30 minutes
   setInterval(runScheduledTweetCheck, SCAN_INTERVAL_MS);
+  console.log(`📅 Tweet scanner scheduled every ${SCAN_INTERVAL_MS / 60000} minutes`);
 }, 2000);
 
 // ===== HELPERS =====
