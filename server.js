@@ -26,7 +26,7 @@ if (!SOLANA_RPC) {
   process.exit(1);
 }
 const USDC_MINT = process.env.USDC_MINT || "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const VAULT_ADDRESS = process.env.VAULT_ADDRESS || "HXAV7ysEaCH8imtGLU7A8c51tbP34NT9t8L3zvfR8L3Q";
+const VAULT_ADDRESS = process.env.VAULT_ADDRESS || "Hu7wMzbwR5RSTXk2bF5CEDhdSAN1mzX9vTiqbQJWESxE";
 
 // Create Solana connection with faster commitment
 const solanaConnection = new Connection(SOLANA_RPC, {
