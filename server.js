@@ -17,14 +17,18 @@ const BOT_HANDLE = (process.env.BOT_HANDLE || "bot_wassy").toLowerCase();
 const X_BEARER_TOKEN = process.env.X_BEARER_TOKEN;
 const SCAN_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 const ADMIN_WALLET = process.env.ADMIN_WALLET || "6SxLVfFovSjR2LAFcJ5wfT6RFjc8GxsscRekGnLq8BMe";
+const DEBUG_MODE = process.env.DEBUG_MODE === "true"; // Set to true for verbose logging
 
-// Solana configuration
-const SOLANA_RPC = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
+// Solana configuration - Use Helius RPC for better performance
+const SOLANA_RPC = process.env.SOLANA_RPC || "https://mainnet.helius-rpc.com/?api-key=1be26e68-fd63-42bf-8f62-d7d79b2f07cf";
 const USDC_MINT = process.env.USDC_MINT || "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const VAULT_ADDRESS = process.env.VAULT_ADDRESS || "HXAV7ysEaCH8imtGLU7A8c51tbP34NT9t8L3zvfR8L3Q";
 
-// Create Solana connection
-const solanaConnection = new Connection(SOLANA_RPC, "confirmed");
+// Create Solana connection with faster commitment
+const solanaConnection = new Connection(SOLANA_RPC, {
+  commitment: "confirmed",
+  confirmTransactionInitialTimeout: 60000
+});
 
 // Load vault keypair for executing transfers
 let vaultKeypair = null;
@@ -128,22 +132,12 @@ async function getSenderFundStatus(walletAddress) {
       const tokenAccount = await getAccount(solanaConnection, ata);
       balance = Number(tokenAccount.amount) / 1_000_000;
 
-      console.log(`🔍 Checking delegation for ${walletAddress.slice(0, 8)}...`);
-      console.log(`   Token Account delegate: ${tokenAccount.delegate?.toBase58() || 'NONE'}`);
-      console.log(`   Expected vault: ${vaultPubkey.toBase58()}`);
-      console.log(`   Delegated amount: ${Number(tokenAccount.delegatedAmount) / 1_000_000} USDC`);
-
       if (tokenAccount.delegate && tokenAccount.delegate.equals(vaultPubkey)) {
         delegatedAmount = Number(tokenAccount.delegatedAmount) / 1_000_000;
         authorized = delegatedAmount > 0;
-        console.log(`   ✅ Authorized: ${authorized} (${delegatedAmount} USDC)`);
-      } else if (tokenAccount.delegate) {
-        console.log(`   ⚠️ Delegate mismatch! Token delegated to: ${tokenAccount.delegate.toBase58()}`);
-      } else {
-        console.log(`   ❌ No delegation set`);
       }
     } catch (tokenErr) {
-      console.log(`Token account not found for ${walletAddress}`);
+      // Token account doesn't exist = 0 balance
     }
 
     return { balance, delegatedAmount, authorized, error: null };
@@ -362,22 +356,11 @@ app.get("/api/claims", async (req, res) => {
     const claims = [];
     claimsQuery.forEach(doc => claims.push({ id: doc.id, ...doc.data() }));
 
-    // Debug: List all users
-    const usersSnapshot = await usersCollection.get();
-    const allUsers = [];
-    usersSnapshot.forEach(doc => allUsers.push(doc.data()));
-    console.log(`📋 Fetching claims for @${handle}`);
-    console.log(`   Users in DB: ${allUsers.map(u => `@${u.x_username}(${u.wallet_address ? 'has wallet' : 'no wallet'})`).join(', ') || 'NONE'}`);
-    console.log(`   Found ${claims.length} pending claims`);
-
     // Enrich with sender fund status
     const enrichedClaims = await Promise.all(claims.map(async (claim) => {
       // Get sender's wallet from Firestore
       const senderDoc = await usersCollection.doc(claim.sender_username).get();
       const senderWallet = senderDoc.exists ? senderDoc.data().wallet_address : null;
-
-      console.log(`📋 Claim: @${claim.sender_username} → @${claim.recipient_username} $${claim.amount}`);
-      console.log(`   Sender wallet from DB: ${senderWallet || 'NOT FOUND'}`);
 
       if (senderWallet) {
         const fundStatus = await getSenderFundStatus(senderWallet);
@@ -391,7 +374,6 @@ app.get("/api/claims", async (req, res) => {
         };
       }
 
-      console.log(`   ⚠️ No wallet found for sender @${claim.sender_username}`);
       return {
         ...claim,
         sender_wallet: null,
@@ -507,10 +489,7 @@ app.post("/api/claim", async (req, res) => {
 
       const transferAmount = Math.floor(payment.amount * 1_000_000);
 
-      console.log(`📤 Initiating transfer: ${payment.amount} USDC`);
-      console.log(`   From: ${senderPubkey.toBase58().slice(0, 8)}... (ATA: ${senderATA.toBase58().slice(0, 8)}...)`);
-      console.log(`   To: ${recipientPubkey.toBase58().slice(0, 8)}... (ATA: ${recipientATA.toBase58().slice(0, 8)}...)`);
-      console.log(`   Fee Payer (Vault): ${vaultKeypair.publicKey.toBase58()}`);
+      console.log(`📤 Transfer: $${payment.amount} USDC from @${payment.sender_username} to @${handle}`);
 
       const transferInstruction = createTransferInstruction(
         senderATA,
@@ -529,10 +508,8 @@ app.post("/api/claim", async (req, res) => {
 
       // Check vault SOL balance before sending
       const vaultBalance = await solanaConnection.getBalance(vaultKeypair.publicKey);
-      console.log(`   Vault SOL balance: ${vaultBalance / 1_000_000_000} SOL`);
-
       if (vaultBalance < 5000) {
-        throw new Error(`Vault has insufficient SOL for fees. Balance: ${vaultBalance / 1_000_000_000} SOL`);
+        throw new Error(`Vault has insufficient SOL for fees`);
       }
 
       txSignature = await sendAndConfirmTransaction(
