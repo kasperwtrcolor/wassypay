@@ -2,7 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
-import { Connection, PublicKey, Keypair, Transaction } from "@solana/web3.js";
+import { Connection, PublicKey, Keypair, Transaction, ComputeBudgetProgram } from "@solana/web3.js";
 import { getAssociatedTokenAddress, getAccount, createTransferInstruction, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import bs58 from "bs58";
 import admin from "firebase-admin";
@@ -495,6 +495,15 @@ app.post("/api/claim", async (req, res) => {
 
       console.log(`📤 Transfer: $${payment.amount} USDC from @${payment.sender_username} to @${handle}`);
 
+      // Add priority fee to ensure transaction gets processed
+      const priorityFee = ComputeBudgetProgram.setComputeUnitPrice({
+        microLamports: 50000  // 50,000 microlamports = 0.00005 SOL per CU
+      });
+
+      const computeLimit = ComputeBudgetProgram.setComputeUnitLimit({
+        units: 100000  // Token transfer needs ~20k, but set higher for safety
+      });
+
       const transferInstruction = createTransferInstruction(
         senderATA,
         recipientATA,
@@ -504,7 +513,11 @@ app.post("/api/claim", async (req, res) => {
         TOKEN_PROGRAM_ID
       );
 
-      const transaction = new Transaction().add(transferInstruction);
+      // Priority fees first, then transfer
+      const transaction = new Transaction()
+        .add(priorityFee)
+        .add(computeLimit)
+        .add(transferInstruction);
       transaction.feePayer = vaultKeypair.publicKey;
 
       const { blockhash, lastValidBlockHeight } = await solanaConnection.getLatestBlockhash('confirmed');
