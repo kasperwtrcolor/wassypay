@@ -642,6 +642,38 @@ app.get("/api/check-fund-status", async (req, res) => {
   }
 });
 
+// ===== LEADERBOARD =====
+
+app.get("/api/leaderboard", async (req, res) => {
+  try {
+    const usersSnapshot = await usersCollection.limit(50).get();
+    const users = [];
+    usersSnapshot.forEach(doc => {
+      const data = doc.data();
+      const totalSent = data.total_sent || 0;
+      const totalClaimed = data.total_claimed || 0;
+      const points = (totalSent * 10) + (totalClaimed * 5); // 10 pts per $ sent, 5 pts per $ claimed
+
+      if (totalSent > 0 || totalClaimed > 0) {
+        users.push({
+          x_username: data.x_username,
+          total_sent: totalSent,
+          total_claimed: totalClaimed,
+          points
+        });
+      }
+    });
+
+    // Sort by points descending
+    users.sort((a, b) => b.points - a.points);
+
+    res.json({ success: true, users: users.slice(0, 20) });
+  } catch (e) {
+    console.error("/api/leaderboard error:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // ===== ADMIN =====
 
 app.get("/api/admin/users", async (req, res) => {
