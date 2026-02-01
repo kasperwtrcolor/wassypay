@@ -657,6 +657,7 @@ app.get("/api/leaderboard", async (req, res) => {
       if (totalSent > 0 || totalClaimed > 0) {
         users.push({
           x_username: data.x_username,
+          wallet_address: doc.id, // The document ID is the wallet address
           total_sent: totalSent,
           total_claimed: totalClaimed,
           points
