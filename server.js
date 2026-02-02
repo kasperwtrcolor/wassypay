@@ -725,6 +725,30 @@ app.get("/api/lottery/active", async (req, res) => {
   }
 });
 
+// Get lottery history (completed/claimed lotteries)
+app.get("/api/lottery/history", async (req, res) => {
+  try {
+    const snapshot = await lotteriesCollection
+      .orderBy("createdAt", "desc")
+      .limit(20)
+      .get();
+
+    const history = [];
+    snapshot.forEach(doc => {
+      const data = { id: doc.id, ...doc.data() };
+      // Only include completed or claimed lotteries with winners
+      if ((data.status === "completed" || data.status === "claimed") && data.winner) {
+        history.push(data);
+      }
+    });
+
+    res.json({ success: true, history });
+  } catch (e) {
+    console.error("/api/lottery/history error:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // Create new lottery (admin only)
 app.post("/api/lottery/create", async (req, res) => {
   const { prizeAmount, endTime } = req.body;
