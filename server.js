@@ -922,10 +922,34 @@ app.post("/api/lottery/claim", async (req, res) => {
     // Check 2: Handle fallback (if stored wallet is same as username, it's the bugged state)
     if (!isMatch && storedWinnerWallet === winnerUsername) {
       console.log(`🔍 Detected legacy handle-as-wallet state. Verifying wallet for user: ${winnerUsername}`);
-      // Fetch user to see if the provided wallet belongs to this username
-      const userDoc = await firestore.collection("users").doc(winnerUsername).get();
-      if (userDoc.exists) {
-        const userData = userDoc.data();
+
+      const handle = (lottery.winner?.username || "").toLowerCase().replace(/^@/, "").trim();
+      let userDoc = null;
+      let userData = null;
+
+      // Try 1: Lookup by document ID (normalized handle)
+      const docRef = firestore.collection("users").doc(handle);
+      const docSnap = await docRef.get();
+      if (docSnap.exists) {
+        userDoc = docSnap;
+        userData = docSnap.data();
+        console.log(`ℹ️ Found user by document ID: ${handle}`);
+      } else {
+        // Try 2: Query by x_username field
+        console.log(`ℹ️ Document ID ${handle} not found. Trying query...`);
+        const querySnap = await firestore.collection("users")
+          .where("x_username", "in", [handle, `@${handle}`])
+          .limit(1)
+          .get();
+
+        if (!querySnap.empty) {
+          userDoc = querySnap.docs[0];
+          userData = querySnap.docs[0].data();
+          console.log(`ℹ️ Found user by x_username query: ${userDoc.id}`);
+        }
+      }
+
+      if (userData) {
         const userWallet1 = (userData.wallet_address || "").toLowerCase();
         const userWallet2 = (userData.walletAddress || "").toLowerCase();
 
@@ -935,10 +959,10 @@ app.post("/api/lottery/claim", async (req, res) => {
           isMatch = true;
           console.log(`✅ Handle verified! User ${winnerUsername} is claiming with wallet ${winnerWallet}`);
         } else {
-          console.warn(`❌ Wallet mismatch for user ${winnerUsername}. Document exists but wallet does not match.`);
+          console.warn(`❌ Wallet mismatch for user ${handle}.`);
         }
       } else {
-        console.warn(`❌ User document not found for handle: ${winnerUsername} during legacy fallback.`);
+        console.warn(`❌ User record not found for handle: ${handle} (tried doc ID and field query)`);
       }
     }
 
