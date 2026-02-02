@@ -689,6 +689,140 @@ app.get("/api/admin/users", async (req, res) => {
   }
 });
 
+// ===== LOTTERY CLAIM =====
+app.post("/api/lottery/claim", async (req, res) => {
+  const { lotteryId, winnerWallet } = req.body;
+
+  if (!lotteryId || !winnerWallet) {
+    return res.status(400).json({ success: false, message: "Missing lotteryId or winnerWallet" });
+  }
+
+  if (!vaultKeypair) {
+    return res.status(500).json({ success: false, message: "Vault not configured for transfers" });
+  }
+
+  console.log(`🎰 Processing lottery claim: ${lotteryId} for ${winnerWallet}`);
+
+  try {
+    // Get lottery from Firebase
+    const lotteriesCollection = firestore.collection("lotteries");
+    const lotteryDoc = await lotteriesCollection.doc(lotteryId).get();
+
+    if (!lotteryDoc.exists) {
+      return res.status(404).json({ success: false, message: "Lottery not found" });
+    }
+
+    const lottery = lotteryDoc.data();
+
+    // Validate lottery status and winner
+    if (lottery.status === 'claimed') {
+      return res.status(400).json({ success: false, message: "Prize already claimed" });
+    }
+
+    if (lottery.status !== 'completed') {
+      return res.status(400).json({ success: false, message: "Lottery not yet drawn" });
+    }
+
+    if (!lottery.winner || lottery.winner.walletAddress !== winnerWallet) {
+      return res.status(403).json({ success: false, message: "Not the winner of this lottery" });
+    }
+
+    const prizeAmount = lottery.prizeAmount || 0;
+    if (prizeAmount <= 0) {
+      return res.status(400).json({ success: false, message: "Invalid prize amount" });
+    }
+
+    // Convert $ to USDC (6 decimals)
+    const usdcAmount = Math.floor(prizeAmount * 1000000);
+
+    // Get token accounts
+    const vaultPubkey = vaultKeypair.publicKey;
+    const recipientPubkey = new PublicKey(winnerWallet);
+    const usdcMintPubkey = new PublicKey(USDC_MINT);
+
+    const vaultAta = await getAssociatedTokenAddress(usdcMintPubkey, vaultPubkey);
+    const recipientAta = await getAssociatedTokenAddress(usdcMintPubkey, recipientPubkey);
+
+    // Check vault balance
+    try {
+      const vaultAccount = await getAccount(solanaConnection, vaultAta);
+      if (Number(vaultAccount.amount) < usdcAmount) {
+        console.error("❌ Insufficient vault balance for lottery claim");
+        return res.status(400).json({
+          success: false,
+          message: `Insufficient vault balance. Need ${prizeAmount} USDC`
+        });
+      }
+    } catch (e) {
+      console.error("❌ Error checking vault balance:", e);
+      return res.status(500).json({ success: false, message: "Could not verify vault balance" });
+    }
+
+    // Build transfer transaction
+    const transaction = new Transaction();
+
+    // Add priority fee for faster confirmation
+    transaction.add(
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 })
+    );
+
+    // Add transfer instruction
+    transaction.add(
+      createTransferInstruction(
+        vaultAta,
+        recipientAta,
+        vaultPubkey,
+        usdcAmount,
+        [],
+        TOKEN_PROGRAM_ID
+      )
+    );
+
+    // Get latest blockhash
+    const { blockhash, lastValidBlockHeight } = await solanaConnection.getLatestBlockhash("confirmed");
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = vaultPubkey;
+
+    // Sign and send
+    transaction.sign(vaultKeypair);
+    const signature = await solanaConnection.sendRawTransaction(transaction.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: "confirmed"
+    });
+
+    console.log(`📤 Lottery prize transfer sent: ${signature}`);
+
+    // Confirm transaction
+    await solanaConnection.confirmTransaction({
+      signature,
+      blockhash,
+      lastValidBlockHeight
+    }, "confirmed");
+
+    console.log(`✅ Lottery prize confirmed: ${signature}`);
+
+    // Update lottery status in Firebase
+    await lotteriesCollection.doc(lotteryId).update({
+      status: 'claimed',
+      claimedAt: admin.firestore.FieldValue.serverTimestamp(),
+      claimTxSignature: signature
+    });
+
+    console.log(`🎉 Lottery ${lotteryId} claimed successfully!`);
+
+    res.json({
+      success: true,
+      txSignature: signature,
+      amount: prizeAmount,
+      message: `Successfully transferred $${prizeAmount} USDC`
+    });
+
+  } catch (e) {
+    console.error("❌ Lottery claim error:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 app.get("/api/rescan", async (req, res) => {
   await runScheduledTweetCheck();
   res.json({ success: true, message: "Manual rescan triggered" });
