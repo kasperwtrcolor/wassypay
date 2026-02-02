@@ -689,6 +689,167 @@ app.get("/api/admin/users", async (req, res) => {
   }
 });
 
+// ===== LOTTERY MANAGEMENT =====
+const lotteriesCollection = firestore.collection("lotteries");
+
+// Get active or recent lottery
+app.get("/api/lottery/active", async (req, res) => {
+  try {
+    // First try to get active lottery
+    let snapshot = await lotteriesCollection
+      .where("status", "==", "active")
+      .orderBy("activatedAt", "desc")
+      .limit(1)
+      .get();
+
+    // If no active, get most recent
+    if (snapshot.empty) {
+      snapshot = await lotteriesCollection
+        .orderBy("createdAt", "desc")
+        .limit(1)
+        .get();
+    }
+
+    if (snapshot.empty) {
+      return res.json({ success: true, lottery: null });
+    }
+
+    const doc = snapshot.docs[0];
+    res.json({ success: true, lottery: { id: doc.id, ...doc.data() } });
+  } catch (e) {
+    console.error("/api/lottery/active error:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// Create new lottery (admin only)
+app.post("/api/lottery/create", async (req, res) => {
+  const { prizeAmount, endTime } = req.body;
+
+  if (!prizeAmount || !endTime) {
+    return res.status(400).json({ success: false, message: "Missing prizeAmount or endTime" });
+  }
+
+  try {
+    const now = new Date();
+    const lotteryId = `lottery_${now.getFullYear()}_${now.getMonth() + 1}_${now.getDate()}_${Date.now()}`;
+
+    const newLottery = {
+      id: lotteryId,
+      prizeAmount: parseFloat(prizeAmount) || 50,
+      endTime: endTime,
+      status: "draft",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      activatedAt: null,
+      winner: null,
+      totalEntries: 0,
+      participantCount: 0,
+      claimedAt: null,
+      claimTxSignature: null
+    };
+
+    await lotteriesCollection.doc(lotteryId).set(newLottery);
+    console.log(`🎰 Lottery created: ${lotteryId} - $${prizeAmount}`);
+
+    res.json({ success: true, lotteryId, lottery: { ...newLottery, id: lotteryId } });
+  } catch (e) {
+    console.error("/api/lottery/create error:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// Activate lottery (admin only)
+app.post("/api/lottery/activate", async (req, res) => {
+  const { lotteryId } = req.body;
+
+  if (!lotteryId) {
+    return res.status(400).json({ success: false, message: "Missing lotteryId" });
+  }
+
+  try {
+    await lotteriesCollection.doc(lotteryId).update({
+      status: "active",
+      activatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    const doc = await lotteriesCollection.doc(lotteryId).get();
+    console.log(`🎰 Lottery activated: ${lotteryId}`);
+
+    res.json({ success: true, lottery: { id: doc.id, ...doc.data() } });
+  } catch (e) {
+    console.error("/api/lottery/activate error:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// Draw lottery winner (admin only)
+app.post("/api/lottery/draw", async (req, res) => {
+  const { lotteryId } = req.body;
+
+  if (!lotteryId) {
+    return res.status(400).json({ success: false, message: "Missing lotteryId" });
+  }
+
+  try {
+    // Get all users with sent payments
+    const usersSnapshot = await usersCollection.get();
+    const eligibleUsers = [];
+
+    usersSnapshot.forEach(doc => {
+      const data = doc.data();
+      const totalSent = data.total_sent || 0;
+      if (totalSent > 0) {
+        eligibleUsers.push({
+          walletAddress: doc.id,
+          username: data.x_username || "unknown",
+          totalSent: totalSent,
+          entries: Math.floor(totalSent / 10) + 1
+        });
+      }
+    });
+
+    if (eligibleUsers.length === 0) {
+      return res.status(400).json({ success: false, message: "No eligible users" });
+    }
+
+    // Build weighted pool
+    const pool = [];
+    eligibleUsers.forEach(user => {
+      for (let i = 0; i < user.entries; i++) {
+        pool.push(user);
+      }
+    });
+
+    // Random selection
+    const winner = pool[Math.floor(Math.random() * pool.length)];
+
+    // Update lottery
+    await lotteriesCollection.doc(lotteryId).update({
+      status: "completed",
+      winner: {
+        username: winner.username,
+        walletAddress: winner.walletAddress,
+        entries: winner.entries
+      },
+      totalEntries: pool.length,
+      participantCount: eligibleUsers.length,
+      completedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    console.log(`🎉 Lottery winner: @${winner.username} (${winner.walletAddress})`);
+
+    res.json({
+      success: true,
+      winner: winner,
+      totalEntries: pool.length,
+      participantCount: eligibleUsers.length
+    });
+  } catch (e) {
+    console.error("/api/lottery/draw error:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // ===== LOTTERY CLAIM =====
 app.post("/api/lottery/claim", async (req, res) => {
   const { lotteryId, winnerWallet } = req.body;
