@@ -825,10 +825,10 @@ app.post("/api/lottery/draw", async (req, res) => {
     usersSnapshot.forEach(doc => {
       const data = doc.data();
       const totalSent = data.total_sent || 0;
-      if (totalSent > 0) {
+      if (totalSent > 0 && data.wallet_address) {
         eligibleUsers.push({
-          walletAddress: doc.id,
-          username: data.x_username || "unknown",
+          walletAddress: data.wallet_address,
+          username: data.x_username || doc.id || "unknown",
           totalSent: totalSent,
           entries: Math.floor(totalSent / 10) + 1
         });
@@ -911,8 +911,32 @@ app.post("/api/lottery/claim", async (req, res) => {
       return res.status(400).json({ success: false, message: "Lottery not yet drawn" });
     }
 
-    if (!lottery.winner || lottery.winner.walletAddress !== winnerWallet) {
-      return res.status(403).json({ success: false, message: "Not the winner of this lottery" });
+    // Safety check: is the winner wallet correct? 
+    const storedWinnerWallet = (lottery.winner?.walletAddress || "").toLowerCase();
+    const providedWinnerWallet = (winnerWallet || "").toLowerCase();
+    const winnerUsername = (lottery.winner?.username || "").toLowerCase();
+
+    // Check 1: Direct match (case-insensitive)
+    let isMatch = storedWinnerWallet === providedWinnerWallet;
+
+    // Check 2: Handle fallback (if stored wallet is same as username, it's the bugged state)
+    if (!isMatch && storedWinnerWallet === winnerUsername) {
+      console.log(`🔍 Detected legacy handle-as-wallet state. Verifying wallet for user: ${winnerUsername}`);
+      // Fetch user to see if the provided wallet belongs to this username
+      const userDoc = await firestore.collection("users").doc(winnerUsername).get();
+      if (userDoc.exists && (userDoc.data().wallet_address || "").toLowerCase() === providedWinnerWallet) {
+        isMatch = true;
+        console.log(`✅ Handle verified! User ${winnerUsername} is claiming with wallet ${winnerWallet}`);
+      }
+    }
+
+    if (!lottery.winner || !isMatch) {
+      console.warn(`❌ Claim rejected: unauthorized wallet. Winner: ${lottery.winner?.walletAddress}, Provided: ${winnerWallet}`);
+      return res.status(403).json({
+        success: false,
+        message: "Not the winner of this lottery",
+        debug: { winner: lottery.winner?.walletAddress, provided: winnerWallet }
+      });
     }
 
     const prizeAmount = lottery.prizeAmount || 0;
