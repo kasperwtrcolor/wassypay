@@ -924,28 +924,25 @@ app.post("/api/lottery/claim", async (req, res) => {
       console.log(`✅ Direct wallet match`);
     } else {
       // Check 2: Username match (legacy bugged lotteries where handle was stored as wallet)
-      console.log(`🔍 No direct match. Checking username... Winner: "${winnerUsername}"`);
+      console.log(`🔍 No direct match. Fetching user doc: "${winnerUsername}"`);
 
-      // Query user by their wallet address (guaranteed to exist from login)
-      const userSnapshot = await firestore.collection("users")
-        .where("wallet_address", "==", winnerWallet)
-        .limit(1)
-        .get();
+      // Fetch user directly (username is doc ID)
+      const userDoc = await firestore.collection("users").doc(winnerUsername).get();
 
-      if (!userSnapshot.empty) {
-        const claimerData = userSnapshot.docs[0].data();
-        const claimerUsername = (claimerData.x_username || "").toLowerCase().replace(/^@/, "");
+      if (userDoc.exists) {
+        const userData = userDoc.data();
+        const storedWallet = (userData.wallet_address || "").toLowerCase();
 
-        console.log(`ℹ️ Found user. Claimer username: "${claimerUsername}", Winner username: "${winnerUsername}"`);
+        console.log(`ℹ️ Doc found. Stored: "${storedWallet}", Provided: "${providedWinnerWallet}"`);
 
-        if (claimerUsername === winnerUsername) {
+        if (storedWallet === providedWinnerWallet) {
           isMatch = true;
-          console.log(`✅ Username match! ${claimerUsername} is claiming.`);
+          console.log(`✅ Verified! ${winnerUsername} claiming.`);
         } else {
-          console.warn(`❌ Username mismatch`);
+          console.warn(`❌ Wallet mismatch`);
         }
       } else {
-        console.warn(`❌ No user found with wallet: ${winnerWallet}`);
+        console.warn(`❌ No doc: ${winnerUsername}`);
       }
     }
 
