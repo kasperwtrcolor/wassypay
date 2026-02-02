@@ -695,27 +695,30 @@ const lotteriesCollection = firestore.collection("lotteries");
 // Get active or recent lottery
 app.get("/api/lottery/active", async (req, res) => {
   try {
-    // First try to get active lottery
-    let snapshot = await lotteriesCollection
-      .where("status", "==", "active")
-      .orderBy("activatedAt", "desc")
-      .limit(1)
+    // Get recent lotteries sorted by createdAt (no composite index needed)
+    const snapshot = await lotteriesCollection
+      .orderBy("createdAt", "desc")
+      .limit(5)
       .get();
-
-    // If no active, get most recent
-    if (snapshot.empty) {
-      snapshot = await lotteriesCollection
-        .orderBy("createdAt", "desc")
-        .limit(1)
-        .get();
-    }
 
     if (snapshot.empty) {
       return res.json({ success: true, lottery: null });
     }
 
-    const doc = snapshot.docs[0];
-    res.json({ success: true, lottery: { id: doc.id, ...doc.data() } });
+    // Find active lottery first, otherwise return most recent
+    let activeLottery = null;
+    let mostRecent = null;
+
+    snapshot.forEach(doc => {
+      const data = { id: doc.id, ...doc.data() };
+      if (!mostRecent) mostRecent = data;
+      if (data.status === "active" && !activeLottery) {
+        activeLottery = data;
+      }
+    });
+
+    const lottery = activeLottery || mostRecent;
+    res.json({ success: true, lottery });
   } catch (e) {
     console.error("/api/lottery/active error:", e);
     res.status(500).json({ success: false, message: e.message });
