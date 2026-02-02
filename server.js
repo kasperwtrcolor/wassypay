@@ -924,9 +924,21 @@ app.post("/api/lottery/claim", async (req, res) => {
       console.log(`🔍 Detected legacy handle-as-wallet state. Verifying wallet for user: ${winnerUsername}`);
       // Fetch user to see if the provided wallet belongs to this username
       const userDoc = await firestore.collection("users").doc(winnerUsername).get();
-      if (userDoc.exists && (userDoc.data().wallet_address || "").toLowerCase() === providedWinnerWallet) {
-        isMatch = true;
-        console.log(`✅ Handle verified! User ${winnerUsername} is claiming with wallet ${winnerWallet}`);
+      if (userDoc.exists) {
+        const userData = userDoc.data();
+        const userWallet1 = (userData.wallet_address || "").toLowerCase();
+        const userWallet2 = (userData.walletAddress || "").toLowerCase();
+
+        console.log(`ℹ️ User found. Stored wallets: "${userWallet1}", "${userWallet2}". Provided: "${providedWinnerWallet}"`);
+
+        if (userWallet1 === providedWinnerWallet || userWallet2 === providedWinnerWallet) {
+          isMatch = true;
+          console.log(`✅ Handle verified! User ${winnerUsername} is claiming with wallet ${winnerWallet}`);
+        } else {
+          console.warn(`❌ Wallet mismatch for user ${winnerUsername}. Document exists but wallet does not match.`);
+        }
+      } else {
+        console.warn(`❌ User document not found for handle: ${winnerUsername} during legacy fallback.`);
       }
     }
 
