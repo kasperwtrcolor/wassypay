@@ -3,7 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
 import { Connection, PublicKey, Keypair, Transaction, ComputeBudgetProgram } from "@solana/web3.js";
-import { getAssociatedTokenAddress, getAccount, createTransferInstruction, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { getAssociatedTokenAddress, getAccount, createTransferInstruction, TOKEN_PROGRAM_ID, createAssociatedTokenAccountInstruction } from "@solana/spl-token";
 import bs58 from "bs58";
 import admin from "firebase-admin";
 
@@ -993,6 +993,26 @@ app.post("/api/lottery/claim", async (req, res) => {
     transaction.add(
       ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 })
     );
+
+    // Check if recipient ATA exists, if not add instruction to create it
+    try {
+      await getAccount(solanaConnection, recipientAta);
+      console.log("ℹ️ Recipient USDC ATA already exists.");
+    } catch (e) {
+      if (e.name === "TokenAccountNotFoundError" || e.message?.includes("could not find account")) {
+        console.log("💡 Creating recipient USDC ATA...");
+        transaction.add(
+          createAssociatedTokenAccountInstruction(
+            vaultPubkey,      // payer
+            recipientAta,     // ata
+            recipientPubkey,   // owner
+            usdcMintPubkey    // mint
+          )
+        );
+      } else {
+        throw e; // Rethrow other errors
+      }
+    }
 
     // Add transfer instruction
     transaction.add(
